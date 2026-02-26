@@ -88,6 +88,13 @@ MODELS = {
     "Gradient Boosting": GradientBoostingRegressor(n_estimators=100, random_state=42),
 }
 
+# Market baseline for each target: the betting-market's best guess at that number
+MARKET_BASELINES = {
+    "team_score": "implied",       # implied team points from moneyline/total
+    "total":      "total_line",    # over/under line
+    "result":     "spread_line",   # spread (market's predicted point diff)
+}
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Model Configuration")
@@ -205,6 +212,10 @@ if train_btn:
     if selected_seasons:
         data = data[data["season"].isin(selected_seasons)]
 
+    # Stash baseline values before we narrow the columns (so they survive dropna on features)
+    baseline_col = MARKET_BASELINES.get(target)
+    baseline_full = data[baseline_col].copy() if baseline_col and baseline_col in data.columns else None
+
     # Drop rows missing the target or any selected feature
     cols_needed = feature_list + [target]
     data = data[cols_needed].dropna()
@@ -238,6 +249,18 @@ if train_btn:
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
 
+    # ── Market baseline metrics ──────────────────────────────────────────────────
+    b_rmse = b_mae = b_r2 = None
+    if baseline_full is not None:
+        baseline_test = baseline_full.loc[y_test.index]
+        valid = baseline_test.notna()
+        if valid.sum() > 10:
+            bt = baseline_test[valid].values
+            yt = y_test[valid].values
+            b_rmse = np.sqrt(mean_squared_error(yt, bt))
+            b_mae  = mean_absolute_error(yt, bt)
+            b_r2   = r2_score(yt, bt)
+
     # ── Results layout ──────────────────────────────────────────────────────────
     st.header("📊 Model Results")
     st.caption(
@@ -245,10 +268,60 @@ if train_btn:
         f"Train rows: {len(X_train):,} · Test rows: {len(X_test):,}"
     )
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("R² Score", f"{r2:.4f}", help="1.0 = perfect; 0 = no better than the mean")
-    m2.metric("RMSE", f"{rmse:.3f}", help="Root Mean Squared Error (same units as target)")
-    m3.metric("MAE", f"{mae:.3f}", help="Mean Absolute Error (same units as target)")
+    # Market baseline comparison banner
+    if b_rmse is not None:
+        beats_rmse = rmse < b_rmse
+        beats_mae  = mae  < b_mae
+        n_beats = sum([beats_rmse, beats_mae])
+        if n_beats == 2:
+            st.success(
+                f"**Model beats the market baseline ({baseline_col}) on both RMSE and MAE.** "
+                f"Market RMSE: {b_rmse:.3f} → Model RMSE: {rmse:.3f} | "
+                f"Market MAE: {b_mae:.3f} → Model MAE: {mae:.3f}"
+            )
+        elif n_beats == 1:
+            st.warning(
+                f"**Model beats the market on one metric.** "
+                f"Market RMSE: {b_rmse:.3f} → Model RMSE: {rmse:.3f} | "
+                f"Market MAE: {b_mae:.3f} → Model MAE: {mae:.3f}"
+            )
+        else:
+            st.error(
+                f"**Model does NOT beat the market baseline ({baseline_col}).** "
+                f"Market RMSE: {b_rmse:.3f} → Model RMSE: {rmse:.3f} | "
+                f"Market MAE: {b_mae:.3f} → Model MAE: {mae:.3f}"
+            )
+
+    # Metrics: model vs market side by side
+    if b_rmse is not None:
+        st.markdown("#### Model vs Market Baseline")
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric(
+            "R²  (Model vs Market)",
+            f"{r2:.4f}",
+            delta=f"{r2 - b_r2:+.4f} vs market",
+            delta_color="normal",
+            help="Higher is better",
+        )
+        mc2.metric(
+            "RMSE  (Model vs Market)",
+            f"{rmse:.3f}",
+            delta=f"{rmse - b_rmse:+.3f} vs market",
+            delta_color="inverse",
+            help="Lower is better — negative delta means model wins",
+        )
+        mc3.metric(
+            "MAE  (Model vs Market)",
+            f"{mae:.3f}",
+            delta=f"{mae - b_mae:+.3f} vs market",
+            delta_color="inverse",
+            help="Lower is better — negative delta means model wins",
+        )
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("R² Score", f"{r2:.4f}", help="1.0 = perfect; 0 = no better than the mean")
+        m2.metric("RMSE", f"{rmse:.3f}", help="Root Mean Squared Error (same units as target)")
+        m3.metric("MAE", f"{mae:.3f}", help="Mean Absolute Error (same units as target)")
 
     col_left, col_right = st.columns(2)
 

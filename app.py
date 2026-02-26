@@ -180,12 +180,19 @@ with tabs[-1]:
     )
     selected_features.update(extra)
 
-feature_list = sorted(selected_features)
-
-# Show summary
-if feature_list:
-    st.success(f"**{len(feature_list)} feature(s) selected:** {', '.join(feature_list)}")
+# Consolidated review — lets users see all selected features and remove any
+all_selected_sorted = sorted(selected_features)
+if all_selected_sorted:
+    st.markdown("**Selected Features** — click × on any tag to remove it:")
+    feature_list = st.multiselect(
+        "selected_features_review",
+        options=all_selected_sorted,
+        default=all_selected_sorted,
+        key="feature_review",
+        label_visibility="collapsed",
+    )
 else:
+    feature_list = []
     st.warning("No features selected yet. Use the tabs above to select predictor columns.")
 
 # ── Train ──────────────────────────────────────────────────────────────────────

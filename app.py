@@ -442,11 +442,17 @@ if train_btn:
         train_resid_std = max(np.std(y_train.values - model.predict(X_train_fit)), 0.01)
 
         # P(Over/Cover) for ALL test rows that have a valid line — used in sample table
+        # For total:  P(actual > total_line)       → effective threshold = +line
+        # For result: P(result + spread_line > 0)  → effective threshold = -line
+        #   (spread_line is negative for favorites in nflfastR, so -spread_line
+        #    is the points the team must WIN by to cover)
         model_prob_full = pd.Series(np.nan, index=y_test.index)
         line_notnull = line_test.notna()
+        line_vals_full = line_test[line_notnull].values
+        eff_line_full  = line_vals_full if target == "total" else -line_vals_full
         model_prob_full.loc[line_notnull[line_notnull].index] = np.clip(
             norm.cdf(
-                (y_pred[line_notnull.values] - line_test[line_notnull].values) / train_resid_std
+                (y_pred[line_notnull.values] - eff_line_full) / train_resid_std
             ),
             1e-6, 1 - 1e-6,
         )
@@ -458,16 +464,18 @@ if train_btn:
             y_v    = y_test[valid_prob].values
             p_v    = y_pred[valid_prob.values]   # positional mask into numpy array
 
-            # Binary outcome: did the first-side event happen?
-            #   total  → actual total went OVER the line
-            #   result → team covered (result > spread_line)
-            y_binary = (y_v > line_v).astype(int)
+            # Effective threshold for each target:
+            #   total  → over if actual > total_line
+            #   result → cover if result > -spread_line  (result + spread_line > 0)
+            eff_line = line_v if target == "total" else -line_v
+
+            y_binary = (y_v > eff_line).astype(int)
 
             # Market no-vig probability for "side 1"
             raw_p1      = american_to_raw_prob(o1_v)
             raw_p2      = american_to_raw_prob(o2_v)
             market_prob = np.clip(remove_vig(raw_p1, raw_p2), 1e-6, 1 - 1e-6)
-            model_prob  = np.clip(norm.cdf((p_v - line_v) / train_resid_std), 1e-6, 1 - 1e-6)
+            model_prob  = np.clip(norm.cdf((p_v - eff_line) / train_resid_std), 1e-6, 1 - 1e-6)
 
             side1_label = "Over" if target == "total" else "Cover"
             prob_results = dict(

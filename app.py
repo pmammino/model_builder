@@ -296,6 +296,19 @@ if train_btn:
         o2_test   = odds_full[o2_col].loc[y_test.index]
         valid_prob = line_test.notna() & o1_test.notna() & o2_test.notna()
 
+        # Residual std from training predictions (used for probability conversion)
+        train_resid_std = max(np.std(y_train.values - model.predict(X_train_fit)), 0.01)
+
+        # P(Over/Cover) for ALL test rows that have a valid line — used in sample table
+        model_prob_full = pd.Series(np.nan, index=y_test.index)
+        line_notnull = line_test.notna()
+        model_prob_full.loc[line_notnull[line_notnull].index] = np.clip(
+            norm.cdf(
+                (y_pred[line_notnull.values] - line_test[line_notnull].values) / train_resid_std
+            ),
+            1e-6, 1 - 1e-6,
+        )
+
         if valid_prob.sum() > 10:
             line_v = line_test[valid_prob].values
             o1_v   = o1_test[valid_prob].values
@@ -309,25 +322,18 @@ if train_btn:
             y_binary = (y_v > line_v).astype(int)
 
             # Market no-vig probability for "side 1"
-            raw_p1     = american_to_raw_prob(o1_v)
-            raw_p2     = american_to_raw_prob(o2_v)
+            raw_p1      = american_to_raw_prob(o1_v)
+            raw_p2      = american_to_raw_prob(o2_v)
             market_prob = np.clip(remove_vig(raw_p1, raw_p2), 1e-6, 1 - 1e-6)
-
-            # Model probability: treat errors as normally distributed
-            # P(actual > line) ≈ norm.cdf((pred − line) / σ_residual)
-            train_resid_std = max(np.std(y_train.values - model.predict(X_train_fit)), 0.01)
             model_prob  = np.clip(norm.cdf((p_v - line_v) / train_resid_std), 1e-6, 1 - 1e-6)
-
-            m_brier   = float(np.mean((model_prob  - y_binary) ** 2))
-            mkt_brier = float(np.mean((market_prob - y_binary) ** 2))
 
             side1_label = "Over" if target == "total" else "Cover"
             prob_results = dict(
                 n=int(valid_prob.sum()),
                 side1_label=side1_label,
                 o1_col=o1_col, o2_col=o2_col,
-                m_brier=m_brier, mkt_brier=mkt_brier,
                 model_prob=model_prob, market_prob=market_prob,
+                model_prob_full=model_prob_full,
                 y_binary=y_binary,
                 train_resid_std=train_resid_std,
                 pct_correct_model=float(np.mean((model_prob > 0.5) == y_binary)),
@@ -369,41 +375,35 @@ if train_btn:
 
     if prob_results is not None:
         side = prob_results["side1_label"].lower()
-        beat = prob_results["m_brier"] < prob_results["mkt_brier"]
-        acc_m   = prob_results["pct_correct_model"]   * 100
-        acc_mkt = prob_results["pct_correct_market"]  * 100
-        brier_edge = prob_results["mkt_brier"] - prob_results["m_brier"]
+        acc_m   = prob_results["pct_correct_model"]  * 100
+        acc_mkt = prob_results["pct_correct_market"] * 100
+        edge    = acc_m - acc_mkt
+        beat    = acc_m > acc_mkt
         summary_lines.append(
             f"The model's numerical predictions were converted to a probability of going "
-            f"**{side}** the line using the spread of training errors "
-            f"(residual std = {prob_results['train_resid_std']:.2f} points). "
-            f"Across {prob_results['n']:,} games with available odds, "
-            f"the model called the correct side **{acc_m:.1f}%** of the time vs "
-            f"the market's **{acc_mkt:.1f}%**."
-        )
-        summary_lines.append(
-            f"The **Brier score** (lower = better; 0.25 = coin flip) was "
-            f"**{prob_results['m_brier']:.4f}** for the model vs "
-            f"**{prob_results['mkt_brier']:.4f}** for the market (no-vig implied probability)."
+            f"**{side}** the line (residual std = {prob_results['train_resid_std']:.2f} points). "
+            f"Across {prob_results['n']:,} games with available odds, the model called the correct "
+            f"side **{acc_m:.1f}%** of the time vs the market's **{acc_mkt:.1f}%** — "
+            f"an edge of **{edge:+.1f} percentage points**."
         )
         if beat:
             summary_lines.append(
-                f"**The model beats the market** — Brier improvement of {brier_edge:+.4f}. "
-                "This means the model's probabilities are better calibrated than what the odds imply. "
-                "That gap is where potential betting edge lives."
+                f"**The model beats the market** — it correctly called the {side} side "
+                f"{edge:.1f}pp more often than the market's implied favourite. "
+                "That frequency edge is where betting value can be extracted."
             )
         else:
             summary_lines.append(
-                f"**The model does not beat the market** — Brier difference of {brier_edge:+.4f}. "
-                "The market's implied probabilities are better calibrated than the model's. "
-                "Try adding more informative features, a different algorithm, or more seasons of data."
+                f"**The model does not beat the market** — the market called the correct side "
+                f"{-edge:.1f}pp more often. Try adding more informative features, a different "
+                "algorithm, or more seasons of data."
             )
     elif b_rmse is not None and target != "team_score":
         if rmse < b_rmse and mae < b_mae:
             summary_lines.append(
                 "The model outperforms the market baseline on both RMSE and MAE. "
-                "Note: probability-based scoring (Brier) was skipped because the required odds "
-                f"columns ({' / '.join(PROB_ODDS.get(target, []))}) were not found in the data."
+                "Note: side-accuracy scoring was skipped because the required odds columns "
+                f"({' / '.join(PROB_ODDS.get(target, []))}) were not found in the data."
             )
         else:
             summary_lines.append(
@@ -417,15 +417,17 @@ if train_btn:
 
     # ── Verdict banner ───────────────────────────────────────────────────────────
     if prob_results is not None:
-        if prob_results["m_brier"] < prob_results["mkt_brier"]:
+        acc_m   = prob_results["pct_correct_model"]  * 100
+        acc_mkt = prob_results["pct_correct_market"] * 100
+        if acc_m > acc_mkt:
             st.success(
-                f"**Model beats the market (Brier score) — "
-                f"Model: {prob_results['m_brier']:.4f} | Market: {prob_results['mkt_brier']:.4f}**"
+                f"**Model beats the market (side accuracy) — "
+                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
             )
         else:
             st.error(
-                f"**Model does NOT beat the market (Brier score) — "
-                f"Model: {prob_results['m_brier']:.4f} | Market: {prob_results['mkt_brier']:.4f}**"
+                f"**Model does NOT beat the market (side accuracy) — "
+                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
             )
     elif b_rmse is not None:
         beats_rmse = rmse < b_rmse
@@ -449,29 +451,26 @@ if train_btn:
 
     # ── Probability metrics (total / result) ─────────────────────────────────────
     if prob_results is not None:
-        st.markdown("#### Probability Scoring vs Market")
-        pc1, pc2, pc3, pc4 = st.columns(4)
+        acc_m   = prob_results["pct_correct_model"]  * 100
+        acc_mkt = prob_results["pct_correct_market"] * 100
+        st.markdown("#### Side Accuracy vs Market")
+        pc1, pc2, pc3 = st.columns(3)
         pc1.metric(
-            "Model Brier Score", f"{prob_results['m_brier']:.4f}",
-            delta=f"{prob_results['m_brier'] - prob_results['mkt_brier']:+.4f} vs market",
-            delta_color="inverse",
-            help="Lower is better. 0.25 = coin flip (uninformative).",
+            "Model Side Accuracy",
+            f"{acc_m:.1f}%",
+            delta=f"{acc_m - acc_mkt:+.1f}pp vs market",
+            delta_color="normal",
+            help=f"% of games where the model's P({prob_results['side1_label']}) > 50% matched the actual outcome.",
         )
         pc2.metric(
-            "Market Brier Score", f"{prob_results['mkt_brier']:.4f}",
-            help="Brier score of the market's no-vig implied probability.",
+            "Market Side Accuracy",
+            f"{acc_mkt:.1f}%",
+            help="% of games where the market's no-vig implied favourite was correct.",
         )
         pc3.metric(
-            f"Model Side Accuracy",
-            f"{prob_results['pct_correct_model']*100:.1f}%",
-            delta=f"{(prob_results['pct_correct_model'] - prob_results['pct_correct_market'])*100:+.1f}pp vs market",
-            delta_color="normal",
-            help=f"% of games the model correctly predicted {prob_results['side1_label']} vs Under/No-Cover.",
-        )
-        pc4.metric(
-            "Market Side Accuracy",
-            f"{prob_results['pct_correct_market']*100:.1f}%",
-            help="% of games the market's favourite side (>50% implied) was correct.",
+            "Games Evaluated",
+            f"{prob_results['n']:,}",
+            help="Test-set games where both the line and odds were available.",
         )
 
     # ── Regression metrics vs market ─────────────────────────────────────────────
@@ -613,6 +612,11 @@ if train_btn:
     sample["Actual"] = y_test.values[:20]
     sample["Predicted"] = np.round(y_pred[:20], 2)
     sample["Error"] = np.round(sample["Actual"] - sample["Predicted"], 2)
+    if prob_results is not None:
+        prob_col_label = f"P({prob_results['side1_label']})"
+        sample[prob_col_label] = (
+            prob_results["model_prob_full"].reset_index(drop=True)[:20].round(3).values
+        )
     st.dataframe(sample, use_container_width=True)
 
     # Download predictions
@@ -620,6 +624,9 @@ if train_btn:
     pred_df["Actual"] = y_test.values
     pred_df["Predicted"] = np.round(y_pred, 2)
     pred_df["Error"] = pred_df["Actual"] - pred_df["Predicted"]
+    if prob_results is not None:
+        prob_col_label = f"P({prob_results['side1_label']})"
+        pred_df[prob_col_label] = prob_results["model_prob_full"].reset_index(drop=True).round(3).values
     csv_out = pred_df.to_csv(index=False).encode()
     st.download_button(
         "⬇️ Download Predictions CSV",

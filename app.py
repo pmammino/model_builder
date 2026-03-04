@@ -3,8 +3,13 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import (
+    RandomForestRegressor, GradientBoostingRegressor,
+    ExtraTreesRegressor, AdaBoostRegressor,
+)
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
@@ -81,12 +86,25 @@ ALL_NUMERIC = sorted(
     ]
 )
 
-MODELS = {
-    "Linear Regression": LinearRegression(),
-    "Ridge Regression": Ridge(),
-    "Lasso Regression": Lasso(),
-    "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
-    "Gradient Boosting": GradientBoostingRegressor(n_estimators=100, random_state=42),
+# Each entry is a callable (seed) → model instance.
+# Models that don't use random_state simply ignore the seed argument.
+MODEL_FACTORIES = {
+    "Linear Regression":    lambda s: LinearRegression(),
+    "Ridge Regression":     lambda s: Ridge(),
+    "Lasso Regression":     lambda s: Lasso(),
+    "ElasticNet":           lambda s: ElasticNet(max_iter=5000),
+    "Random Forest":        lambda s: RandomForestRegressor(n_estimators=100, random_state=s),
+    "Extra Trees":          lambda s: ExtraTreesRegressor(n_estimators=100, random_state=s),
+    "Gradient Boosting":    lambda s: GradientBoostingRegressor(n_estimators=100, random_state=s),
+    "AdaBoost":             lambda s: AdaBoostRegressor(n_estimators=100, random_state=s),
+    "Support Vector (RBF)": lambda s: SVR(kernel="rbf"),
+    "K-Nearest Neighbors":  lambda s: KNeighborsRegressor(),
+}
+
+# Models that need feature scaling (distance/magnitude sensitive)
+SCALE_MODELS = {
+    "Linear Regression", "Ridge Regression", "Lasso Regression", "ElasticNet",
+    "Support Vector (RBF)", "K-Nearest Neighbors",
 }
 
 # Market baseline for each target: the betting-market's best guess at that number
@@ -133,7 +151,7 @@ with st.sidebar:
 
     # Model type
     st.subheader("2. Model Type")
-    model_name = st.selectbox("Algorithm", list(MODELS.keys()))
+    model_name = st.selectbox("Algorithm", list(MODEL_FACTORIES.keys()))
 
     # Train/test split
     st.subheader("3. Train / Test Split")
@@ -147,6 +165,24 @@ with st.sidebar:
         options=seasons,
         default=[],
     )
+
+    # Random seed — random on first load so each session builds a unique model
+    st.subheader("5. Random Seed")
+    if "model_seed" not in st.session_state:
+        st.session_state["model_seed"] = int(np.random.randint(1, 99999))
+    seed_col, btn_col = st.columns([3, 1])
+    with seed_col:
+        seed = st.number_input(
+            "Seed", min_value=1, max_value=99999,
+            value=st.session_state["model_seed"], step=1,
+            help="Controls train/test split and model randomness. Same seed + same config = same model.",
+        )
+        st.session_state["model_seed"] = int(seed)
+    with btn_col:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🎲", help="Pick a new random seed"):
+            st.session_state["model_seed"] = int(np.random.randint(1, 99999))
+            st.rerun()
 
     st.divider()
     st.caption("Select features in the main panel, then click **Train Model**.")
@@ -253,17 +289,16 @@ if train_btn:
     y = data[target]
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=42
+        X, y, test_size=test_size, random_state=seed
     )
 
-    # Scale for linear models
-    scaler = None
-    model = MODELS[model_name]
-    if model_name in ("Linear Regression", "Ridge Regression", "Lasso Regression"):
+    model = MODEL_FACTORIES[model_name](seed)
+    if model_name in SCALE_MODELS:
         scaler = StandardScaler()
         X_train_fit = scaler.fit_transform(X_train)
         X_test_fit = scaler.transform(X_test)
     else:
+        scaler = None
         X_train_fit = X_train.values
         X_test_fit = X_test.values
 
@@ -344,7 +379,8 @@ if train_btn:
     st.header("📊 Model Results")
     st.caption(
         f"**{model_name}** · Target: `{target}` · "
-        f"Train rows: {len(X_train):,} · Test rows: {len(X_test):,}"
+        f"Train rows: {len(X_train):,} · Test rows: {len(X_test):,} · "
+        f"Seed: `{seed}`"
     )
 
     # ── Plain English Summary ────────────────────────────────────────────────────

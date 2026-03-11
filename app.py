@@ -11,9 +11,10 @@ from sklearn.ensemble import (
 )
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV, KFold
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 from scipy.stats import norm
 import warnings
 
@@ -214,6 +215,36 @@ SCALE_MODELS = {
     "Support Vector (RBF)", "K-Nearest Neighbors",
 }
 
+# Hyperparameter search spaces for RandomizedSearchCV.
+# Keys use the pipeline step prefix "model__" so they work with Pipeline objects.
+# Models without tunable parameters (Linear Regression) are omitted.
+PARAM_GRIDS = {
+    "Ridge Regression":     {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
+    "Lasso Regression":     {"model__alpha": [0.001, 0.01, 0.1, 1.0, 10.0]},
+    "ElasticNet":           {"model__alpha": [0.001, 0.01, 0.1, 1.0],
+                             "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9]},
+    "Random Forest":        {"model__n_estimators": [50, 100, 200, 300],
+                             "model__max_depth": [None, 5, 10, 20],
+                             "model__min_samples_split": [2, 5, 10],
+                             "model__max_features": ["sqrt", "log2", 0.5]},
+    "Extra Trees":          {"model__n_estimators": [50, 100, 200, 300],
+                             "model__max_depth": [None, 5, 10, 20],
+                             "model__min_samples_split": [2, 5, 10],
+                             "model__max_features": ["sqrt", "log2", 0.5]},
+    "Gradient Boosting":    {"model__n_estimators": [50, 100, 200],
+                             "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
+                             "model__max_depth": [3, 4, 5, 6],
+                             "model__subsample": [0.7, 0.8, 1.0]},
+    "AdaBoost":             {"model__n_estimators": [50, 100, 150, 200],
+                             "model__learning_rate": [0.01, 0.1, 0.5, 1.0]},
+    "Support Vector (RBF)": {"model__C": [0.1, 1.0, 10.0, 100.0],
+                             "model__epsilon": [0.01, 0.1, 0.5, 1.0],
+                             "model__gamma": ["scale", "auto"]},
+    "K-Nearest Neighbors":  {"model__n_neighbors": [3, 5, 7, 10, 15, 20],
+                             "model__weights": ["uniform", "distance"],
+                             "model__metric": ["euclidean", "manhattan"]},
+}
+
 # Market baseline for each target: the betting-market's best guess at that number
 MARKET_BASELINES = {
     "team_score": "implied",       # implied team points from moneyline/total
@@ -290,6 +321,31 @@ with st.sidebar:
         if st.button("🎲", help="Pick a new random seed"):
             st.session_state["model_seed"] = int(np.random.randint(1, 99999))
             st.rerun()
+
+    # Cross-validation
+    st.subheader("6. Cross-Validation")
+    cv_enabled = st.toggle("Enable cross-validation", value=True,
+                           help="Evaluate model consistency across multiple folds of training data.")
+    cv_folds = st.slider("CV folds", min_value=3, max_value=10, value=5,
+                         disabled=not cv_enabled,
+                         help="More folds = more reliable estimate but slower.")
+
+    # Hyperparameter tuning
+    st.subheader("7. Hyperparameter Tuning")
+    can_tune = model_name in PARAM_GRIDS
+    tune_enabled = st.toggle(
+        "Auto-tune hyperparameters",
+        value=False,
+        disabled=not can_tune,
+        help="Searches for the best model settings using randomized search + cross-validation. "
+             "Slower but often improves accuracy." if can_tune
+             else f"{model_name} has no tunable hyperparameters.",
+    )
+    n_iter = st.slider(
+        "Search iterations", min_value=10, max_value=100, value=20, step=5,
+        disabled=not (tune_enabled and can_tune),
+        help="Number of random hyperparameter combinations to try. More = better search, slower runtime.",
+    )
 
     st.divider()
     st.caption("Select features in the main panel, then click **Train Model**.")
@@ -399,18 +455,62 @@ if train_btn:
         X, y, test_size=test_size, random_state=seed
     )
 
-    model = MODEL_FACTORIES[model_name](seed)
+    # Build pipeline — scaler is part of the pipeline so CV folds are leak-free
+    base_model = MODEL_FACTORIES[model_name](seed)
+    steps = [("model", base_model)]
     if model_name in SCALE_MODELS:
-        scaler = StandardScaler()
-        X_train_fit = scaler.fit_transform(X_train)
-        X_test_fit = scaler.transform(X_test)
-    else:
-        scaler = None
-        X_train_fit = X_train.values
-        X_test_fit = X_test.values
+        steps.insert(0, ("scaler", StandardScaler()))
+    pipeline = Pipeline(steps)
 
-    model.fit(X_train_fit, y_train)
-    y_pred = model.predict(X_test_fit)
+    best_params = None
+    cv_results  = None
+    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=seed)
+
+    # ── Hyperparameter tuning ────────────────────────────────────────────────────
+    if tune_enabled and model_name in PARAM_GRIDS:
+        with st.spinner(
+            f"Tuning {model_name} — {n_iter} iterations × {cv_folds}-fold CV …"
+        ):
+            search = RandomizedSearchCV(
+                pipeline,
+                PARAM_GRIDS[model_name],
+                n_iter=n_iter,
+                cv=kf,
+                scoring="neg_mean_absolute_error",
+                random_state=seed,
+                n_jobs=-1,
+                refit=True,
+            )
+            search.fit(X_train, y_train)
+        pipeline   = search.best_estimator_
+        best_params = {
+            k.replace("model__", ""): v for k, v in search.best_params_.items()
+        }
+    else:
+        pipeline.fit(X_train, y_train)
+
+    # ── Cross-validation (always on training data, with final pipeline config) ───
+    if cv_enabled:
+        with st.spinner(f"Running {cv_folds}-fold cross-validation …"):
+            rmse_scores = -cross_val_score(
+                pipeline, X_train, y_train, cv=kf,
+                scoring="neg_root_mean_squared_error",
+            )
+            mae_scores = -cross_val_score(
+                pipeline, X_train, y_train, cv=kf,
+                scoring="neg_mean_absolute_error",
+            )
+            r2_scores = cross_val_score(
+                pipeline, X_train, y_train, cv=kf, scoring="r2",
+            )
+        cv_results = {
+            "folds":     cv_folds,
+            "rmse":      rmse_scores,
+            "mae":       mae_scores,
+            "r2":        r2_scores,
+        }
+
+    y_pred = pipeline.predict(X_test)
 
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae = mean_absolute_error(y_test, y_pred)
@@ -439,7 +539,7 @@ if train_btn:
         valid_prob = line_test.notna() & o1_test.notna() & o2_test.notna()
 
         # Residual std from training predictions (used for probability conversion)
-        train_resid_std = max(np.std(y_train.values - model.predict(X_train_fit)), 0.01)
+        train_resid_std = max(np.std(y_train.values - pipeline.predict(X_train)), 0.01)
 
         # P(Over/Cover) for ALL test rows that have a valid line — used in sample table
         # For total:  P(actual > total_line)       → effective threshold = +line
@@ -649,6 +749,78 @@ if train_btn:
         m2.metric("RMSE", f"{rmse:.3f}", help="Root Mean Squared Error (same units as target).")
         m3.metric("MAE", f"{mae:.3f}", help="Mean Absolute Error (same units as target).")
 
+    # ── Cross-validation results ──────────────────────────────────────────────────
+    if cv_results is not None:
+        r = cv_results
+        rmse_cv, mae_cv, r2_cv = r["rmse"], r["mae"], r["r2"]
+        cv_stable = (rmse_cv.std() / rmse_cv.mean()) < 0.10  # <10% CoV = stable
+
+        st.markdown("#### Cross-Validation Results (training data)")
+        if cv_stable:
+            st.success(
+                f"**Model is stable** — RMSE varied by less than 10% across folds "
+                f"(CV: {rmse_cv.mean():.3f} ± {rmse_cv.std():.3f})"
+            )
+        else:
+            st.warning(
+                f"**Model shows variance across folds** — RMSE CoV "
+                f"{rmse_cv.std()/rmse_cv.mean()*100:.1f}%. "
+                "Consider more data, fewer features, or stronger regularisation."
+            )
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric(
+            "CV RMSE", f"{rmse_cv.mean():.3f}",
+            delta=f"±{rmse_cv.std():.3f} std",
+            delta_color="off",
+            help="Mean RMSE across all CV folds (lower is better).",
+        )
+        cc2.metric(
+            "CV MAE", f"{mae_cv.mean():.3f}",
+            delta=f"±{mae_cv.std():.3f} std",
+            delta_color="off",
+            help="Mean MAE across all CV folds (lower is better).",
+        )
+        cc3.metric(
+            "CV R²", f"{r2_cv.mean():.4f}",
+            delta=f"±{r2_cv.std():.4f} std",
+            delta_color="off",
+            help="Mean R² across all CV folds (higher is better).",
+        )
+
+        fold_df = pd.DataFrame({
+            "Fold":  [f"Fold {i+1}" for i in range(r["folds"])],
+            "RMSE":  rmse_cv,
+            "MAE":   mae_cv,
+            "R²":    r2_cv,
+        })
+        fig_cv = px.bar(
+            fold_df, x="Fold", y="RMSE",
+            title=f"{r['folds']}-Fold CV — RMSE per Fold",
+            color="RMSE",
+            color_continuous_scale="Blues_r",
+            text=fold_df["RMSE"].round(3),
+        )
+        fig_cv.add_hline(
+            y=rmse_cv.mean(), line_dash="dash", line_color="#00AEEF",
+            annotation_text=f"Mean {rmse_cv.mean():.3f}",
+        )
+        fig_cv.update_traces(textposition="outside")
+        fig_cv.update_layout(showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig_cv, use_container_width=True)
+
+    # ── Best hyperparameters (if tuned) ──────────────────────────────────────────
+    if best_params is not None:
+        with st.expander("🔧 Auto-Tuned Hyperparameters", expanded=False):
+            st.caption(
+                f"Best parameters found by RandomizedSearchCV "
+                f"({n_iter} iterations, {cv_folds}-fold CV, scored on MAE)."
+            )
+            params_df = pd.DataFrame(
+                list(best_params.items()), columns=["Parameter", "Value"]
+            )
+            st.dataframe(params_df, use_container_width=True, hide_index=True)
+
     # ── Model vs Market probability scatter ──────────────────────────────────────
     if prob_results is not None:
         st.markdown("#### Model vs Market Probability (each dot = one game)")
@@ -721,11 +893,12 @@ if train_btn:
 
     # Feature importance / coefficients
     st.subheader("Feature Importance / Coefficients")
+    fitted_model = pipeline.named_steps["model"]
 
-    if hasattr(model, "coef_"):
+    if hasattr(fitted_model, "coef_"):
         coef_df = pd.DataFrame({
             "Feature": feature_list,
-            "Coefficient": model.coef_,
+            "Coefficient": fitted_model.coef_,
         }).sort_values("Coefficient", key=abs, ascending=False)
         fig_coef = px.bar(
             coef_df,
@@ -740,10 +913,10 @@ if train_btn:
         fig_coef.update_layout(yaxis={"categoryorder": "total ascending"})
         st.plotly_chart(fig_coef, use_container_width=True)
 
-    elif hasattr(model, "feature_importances_"):
+    elif hasattr(fitted_model, "feature_importances_"):
         imp_df = pd.DataFrame({
             "Feature": feature_list,
-            "Importance": model.feature_importances_,
+            "Importance": fitted_model.feature_importances_,
         }).sort_values("Importance", ascending=False)
         fig_imp = px.bar(
             imp_df,

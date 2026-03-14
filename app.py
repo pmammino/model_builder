@@ -16,6 +16,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from scipy.stats import norm
+import requests
+import io
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -926,6 +928,167 @@ if train_btn:
         file_name=f"nfl_predictions_{target}_{model_name.replace(' ', '_')}.csv",
         mime="text/csv",
     )
+
+    # Persist the trained model so the prediction section survives reruns
+    st.session_state["trained_pipeline"]     = pipeline
+    st.session_state["trained_features"]     = feature_list
+    st.session_state["trained_target"]       = target
+    st.session_state["trained_resid_std"]    = (
+        prob_results["train_resid_std"] if prob_results else None
+    )
+    st.session_state["trained_prob_label"]   = (
+        prob_results["side1_label"] if prob_results else None
+    )
+    st.session_state["trained_baseline_col"] = baseline_col
+
+# ── Predict on New Data ────────────────────────────────────────────────────────
+if "trained_pipeline" in st.session_state:
+    st.divider()
+    st.header("🔮 Predict on New Data")
+    st.caption(
+        f"Run the trained **{st.session_state.get('trained_target','?')}** model "
+        "on fresh game data to generate predictions."
+    )
+
+    _pipeline   = st.session_state["trained_pipeline"]
+    _features   = st.session_state["trained_features"]
+    _target     = st.session_state["trained_target"]
+    _resid_std  = st.session_state["trained_resid_std"]
+    _prob_label = st.session_state["trained_prob_label"]
+    _base_col   = st.session_state["trained_baseline_col"]
+
+    input_method = st.radio(
+        "Input method",
+        ["Upload CSV", "API Feed URL"],
+        horizontal=True,
+        help="CSV is the primary option. API feed allows pasting a URL that returns JSON or CSV data.",
+    )
+
+    new_df = None
+
+    if input_method == "Upload CSV":
+        uploaded = st.file_uploader(
+            "Upload a CSV file containing the required feature columns",
+            type=["csv"],
+            help=(
+                "The file must contain all feature columns used during training. "
+                "Extra columns are ignored. The target column is optional."
+            ),
+        )
+        if uploaded is not None:
+            try:
+                new_df = pd.read_csv(uploaded)
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}")
+
+    else:  # API Feed URL
+        api_sources = {
+            "Custom URL": "",
+            "nflfastR play-by-play (sample)": "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_2023.csv",
+        }
+        api_choice = st.selectbox("Select a source or choose Custom URL", list(api_sources.keys()))
+        api_url = st.text_input(
+            "API / feed URL",
+            value=api_sources[api_choice],
+            placeholder="https://example.com/data.csv  or  .../data.json",
+        )
+        fetch_btn = st.button("Fetch Data", type="primary", key="fetch_api")
+        if fetch_btn and api_url.strip():
+            with st.spinner("Fetching data from URL…"):
+                try:
+                    resp = requests.get(api_url.strip(), timeout=30)
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("Content-Type", "")
+                    raw = resp.content
+                    # Try CSV first, then JSON
+                    try:
+                        new_df = pd.read_csv(io.BytesIO(raw))
+                    except Exception:
+                        try:
+                            new_df = pd.read_json(io.BytesIO(raw))
+                        except Exception:
+                            st.error(
+                                "Could not parse the response as CSV or JSON. "
+                                "Please check the URL and try again."
+                            )
+                except requests.exceptions.RequestException as e:
+                    st.error(f"Failed to fetch URL: {e}")
+
+    # ── Run predictions on the loaded DataFrame ────────────────────────────────
+    if new_df is not None:
+        st.markdown(f"**Loaded {len(new_df):,} rows × {new_df.shape[1]} columns.**")
+
+        # Validate that required feature columns are present
+        missing_cols = [c for c in _features if c not in new_df.columns]
+        if missing_cols:
+            st.error(
+                f"The following feature columns are missing from the uploaded data: "
+                f"`{'`, `'.join(missing_cols)}`\n\n"
+                "Please make sure your file contains all features that were selected "
+                "during training."
+            )
+        else:
+            # Drop rows with nulls in feature columns and warn about it
+            pred_input = new_df[_features].copy()
+            n_before = len(pred_input)
+            pred_input = pred_input.dropna()
+            n_dropped = n_before - len(pred_input)
+            if n_dropped > 0:
+                st.warning(
+                    f"{n_dropped:,} row(s) were dropped because they had missing values "
+                    "in one or more feature columns."
+                )
+
+            if len(pred_input) == 0:
+                st.error("No valid rows remain after dropping rows with missing values.")
+            else:
+                with st.spinner("Generating predictions…"):
+                    new_preds = _pipeline.predict(pred_input)
+
+                result_df = pred_input.copy().reset_index(drop=True)
+
+                # Carry over non-feature columns from original upload for context
+                meta_cols = [c for c in new_df.columns if c not in _features]
+                for mc in meta_cols:
+                    result_df.insert(0, mc, new_df.loc[pred_input.index, mc].values)
+
+                result_df["Predicted"] = np.round(new_preds, 2)
+
+                # P(Over/Cover) if the model supports it
+                if _resid_std is not None and _base_col in new_df.columns:
+                    line_vals = new_df.loc[pred_input.index, _base_col].values.astype(float)
+                    eff_line  = line_vals if _target == "total" else -line_vals
+                    prob_vals = np.clip(
+                        norm.cdf((new_preds - eff_line) / _resid_std),
+                        1e-6, 1 - 1e-6,
+                    )
+                    prob_vals = np.where(np.isnan(line_vals), np.nan, prob_vals)
+                    result_df[f"P({_prob_label})"] = np.round(prob_vals, 3)
+                elif _resid_std is not None and _base_col not in new_df.columns:
+                    st.info(
+                        f"Column `{_base_col}` not found in the uploaded data — "
+                        f"P({_prob_label}) will not be calculated."
+                    )
+
+                # Show the target column if present
+                if _target in new_df.columns:
+                    result_df["Actual"] = new_df.loc[pred_input.index, _target].values
+                    result_df["Error"]  = np.round(
+                        result_df["Actual"] - result_df["Predicted"], 2
+                    )
+
+                st.success(f"Predictions generated for {len(result_df):,} games.")
+                st.dataframe(result_df, use_container_width=True)
+
+                # Download
+                dl_csv = result_df.to_csv(index=False).encode()
+                st.download_button(
+                    "⬇️ Download New Predictions CSV",
+                    data=dl_csv,
+                    file_name=f"new_predictions_{_target}.csv",
+                    mime="text/csv",
+                    key="dl_new_preds",
+                )
 
 # ── Data explorer ──────────────────────────────────────────────────────────────
 with st.expander("🔍 Data Explorer"):

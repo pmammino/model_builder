@@ -31,19 +31,13 @@ st.set_page_config(
 # ── Brand CSS ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Sidebar ── */
+/* Sidebar */
 [data-testid="stSidebar"] {
     background: #08090F;
     border-right: 1px solid #1E2235;
 }
-[data-testid="stSidebar"] .stMarkdown,
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] .stSlider label {
-    color: #C8CDD8;
-}
 
-/* ── Metric cards ── */
+/* Metric cards */
 [data-testid="metric-container"] {
     background: #161B27;
     border: 1px solid #1E2235;
@@ -51,86 +45,60 @@ st.markdown("""
     padding: 14px 18px;
 }
 
-/* ── Primary button (Train Model) ── */
-button[kind="primary"] {
+/* Primary button — Streamlit 1.44+ testid */
+[data-testid="stBaseButton-primary"] {
     background: linear-gradient(135deg, #00AEEF 0%, #0077CC 100%) !important;
     border: none !important;
-    color: #fff !important;
+    color: #ffffff !important;
     font-weight: 600 !important;
-    letter-spacing: 0.3px;
 }
-button[kind="primary"]:hover {
+[data-testid="stBaseButton-primary"]:hover {
     background: linear-gradient(135deg, #17C4FF 0%, #0088EE 100%) !important;
 }
 
-/* ── Active tab indicator ── */
+/* Active tab */
 .stTabs [aria-selected="true"] {
     color: #00AEEF !important;
     border-bottom: 2px solid #00AEEF !important;
 }
 
-/* ── Section dividers ── */
-hr { border-color: #1E2235; }
-
-/* ── Expander header ── */
-details summary {
+/* Expander headers — scoped to stExpander so it doesn't hit internal details */
+[data-testid="stExpander"] summary span {
     color: #00AEEF;
     font-weight: 600;
 }
 
-/* ── Header band ── */
-.nfl-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: linear-gradient(135deg, #000000 0%, #0E1117 60%, #130D22 100%);
-    border-bottom: 2px solid #1E2235;
-    padding: 18px 28px;
-    margin: -1rem -1rem 1.5rem -1rem;
-    border-radius: 0 0 8px 8px;
-}
-.nfl-header-title {
-    text-align: center;
-    flex: 1;
-}
-.nfl-header-title h1 {
-    margin: 0;
-    font-size: 1.9rem;
-    font-weight: 700;
-    background: linear-gradient(90deg, #00AEEF, #9B30FF);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-.nfl-header-title p {
-    margin: 4px 0 0;
-    color: #7A8299;
-    font-size: 0.85rem;
-}
-.nfl-logo-box {
-    width: 150px;
-    display: flex;
-    align-items: center;
-}
-.nfl-logo-box.right { justify-content: flex-end; }
+/* Dividers */
+hr { border-color: #1E2235; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Header with logos ──────────────────────────────────────────────────────────
-oj_logo  = "assets/oddsjam.png"
-rw_logo  = "assets/rotowire.png"
+oj_logo = "assets/oddsjam.png"
+rw_logo = "assets/rotowire.png"
 
 left_col, title_col, right_col = st.columns([1.2, 4, 1.2])
 with left_col:
     if os.path.exists(oj_logo):
         st.image(oj_logo, width=140)
 with title_col:
-    st.markdown("""
-    <div class="nfl-header-title">
-        <h1>🏈 NFL Prediction Model Builder</h1>
-        <p>Select features, choose a target, and train a model to predict NFL game outcomes.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # Inline styles keep the gradient scoped; no external CSS class needed
+    st.markdown(
+        """
+        <div style="text-align:center; padding:8px 0;">
+          <span style="font-size:1.9rem; font-weight:700;
+                       background:linear-gradient(90deg,#00AEEF,#9B30FF);
+                       -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+                       background-clip:text;">
+            🏈 NFL Prediction Model Builder
+          </span>
+          <p style="margin:4px 0 0; color:#7A8299; font-size:0.85rem;">
+            Select features, choose a target, and train a model to predict NFL game outcomes.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 with right_col:
     if os.path.exists(rw_logo):
         st.image(rw_logo, width=140)

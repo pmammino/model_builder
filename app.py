@@ -119,7 +119,7 @@ def load_data():
 df = load_data()
 
 # ── Column groups ──────────────────────────────────────────────────────────────
-TARGET_COLS = ["team_score", "total", "result"]
+TARGET_COLS = ["total", "result"]
 
 EXCLUDE = {
     "game_id", "old_game_id", "gsis", "nfl_detail_id", "pfr", "pff", "espn",
@@ -210,9 +210,8 @@ PARAM_GRIDS = {
 }
 
 MARKET_BASELINES = {
-    "team_score": "implied",
-    "total":      "total_line",
-    "result":     "spread_line",
+    "total":  "total_line",
+    "result": "spread_line",
 }
 
 PROB_ODDS = {
@@ -260,7 +259,6 @@ with st.sidebar:
         "What do you want to predict?",
         options=TARGET_COLS,
         format_func=lambda x: {
-            "team_score": "Team Score (points scored)",
             "total": "Total Points (combined score)",
             "result": "Result (point differential)",
         }[x],
@@ -714,21 +712,6 @@ if "results" in st.session_state:
             f"**{len(res['feature_list'])} feature(s)** and evaluated on **{res['n_test']:,} held-out games**."
         )
 
-        if res["target"] == "team_score" and res["b_mae"] is not None:
-            edge = res["b_mae"] - res["mae"]
-            sl.append(
-                f"On average the model's score predictions were off by **{res['mae']:.2f} points**, "
-                f"compared to the market's implied score being off by **{res['b_mae']:.2f} points** — "
-                f"the model is **{abs(edge):.2f} points {'better' if edge > 0 else 'worse'}** than the market."
-            )
-            sl.append(
-                "The model is adding predictive information on top of what the market already prices in. "
-                "That's a promising signal for building value bets around team scoring."
-                if edge > 0 else
-                "The market implied score is still more accurate than the model. "
-                "Stronger features or more data are needed to overcome the market."
-            )
-
         if prob is not None:
             side    = prob["side1_label"].lower()
             acc_m   = prob["pct_correct_model"]  * 100
@@ -777,7 +760,7 @@ if "results" in st.session_state:
                 f"**The model does not beat the market** — the market called the correct side "
                 f"{-edge:.1f}pp more often. Try different features, algorithm, or more seasons."
             )
-        elif res["b_rmse"] is not None and res["target"] != "team_score":
+        elif res["b_rmse"] is not None:
             sl.append(
                 "The model outperforms the market baseline on both RMSE and MAE."
                 if res["rmse"] < res["b_rmse"] and res["mae"] < res["b_mae"] else
@@ -1305,8 +1288,7 @@ with st.expander("🔍 Data Explorer"):
 
     st.dataframe(
         explore_df[[
-            search_col, "team", "opponent", "season", "week",
-            target if target in df.columns else "team_score"
+            search_col, "team", "opponent", "season", "week", "total", "result"
         ]].head(200),
         use_container_width=True,
     )

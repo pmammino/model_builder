@@ -603,6 +603,8 @@ if train_btn:
         summary_lines.append(
             f"The model's numerical predictions were converted to a probability of going "
             f"**{side}** the line (residual std = {prob_results['train_resid_std']:.2f} points). "
+            f"A game is graded correct when the model predicted {side} (P > 50%) and it hit, "
+            f"**or** predicted {('Under' if side == 'over' else 'No Cover')} (P < 50%) and it hit. "
             f"Across {prob_results['n']:,} games with available odds, the model called the correct "
             f"side **{acc_m:.1f}%** of the time vs the market's **{acc_mkt:.1f}%** — "
             f"an edge of **{edge:+.1f} percentage points**."
@@ -681,12 +683,19 @@ if train_btn:
             f"{acc_m:.1f}%",
             delta=f"{acc_m - acc_mkt:+.1f}pp vs market",
             delta_color="normal",
-            help=f"% of games where the model's P({prob_results['side1_label']}) > 50% matched the actual outcome.",
+            help=(
+                f"% of games where the model predicted the correct side — "
+                f"P({prob_results['side1_label']}) > 50% and {prob_results['side1_label']} hit, "
+                f"OR P({prob_results['side1_label']}) < 50% and Under/No Cover hit."
+            ),
         )
         pc2.metric(
             "Market Side Accuracy",
             f"{acc_mkt:.1f}%",
-            help="% of games where the market's no-vig implied favourite was correct.",
+            help=(
+                "% of games where the market's no-vig implied favourite was correct — "
+                "market P > 50% and that side hit, or market P < 50% and the other side hit."
+            ),
         )
         pc3.metric(
             "Games Evaluated",

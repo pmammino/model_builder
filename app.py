@@ -12,7 +12,11 @@ from sklearn.ensemble import (
 from sklearn.svm import SVR
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV, KFold
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import (
+    mean_squared_error, mean_absolute_error, r2_score,
+    brier_score_loss, log_loss, roc_auc_score,
+    median_absolute_error, max_error, explained_variance_score,
+)
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from scipy.stats import norm
@@ -84,7 +88,6 @@ with left_col:
     if os.path.exists(oj_logo):
         st.image(oj_logo, width=140)
 with title_col:
-    # Inline styles keep the gradient scoped; no external CSS class needed
     st.markdown(
         """
         <div style="text-align:center; padding:8px 0;">
@@ -118,11 +121,9 @@ df = load_data()
 # ── Column groups ──────────────────────────────────────────────────────────────
 TARGET_COLS = ["team_score", "total", "result"]
 
-# All numeric columns minus targets and ID/metadata columns
 EXCLUDE = {
     "game_id", "old_game_id", "gsis", "nfl_detail_id", "pfr", "pff", "espn",
     "ftn", "stadium_id",
-    # exclude the other two targets so they can't be features for the chosen target
 }
 EXCLUDE.update(TARGET_COLS)
 
@@ -153,7 +154,6 @@ FEATURE_GROUPS = {
     ],
 }
 
-# Only keep columns that actually exist in the dataframe
 for group in FEATURE_GROUPS:
     FEATURE_GROUPS[group] = [c for c in FEATURE_GROUPS[group] if c in df.columns]
 
@@ -164,8 +164,6 @@ ALL_NUMERIC = sorted(
     ]
 )
 
-# Each entry is a callable (seed) → model instance.
-# Models that don't use random_state simply ignore the seed argument.
 MODEL_FACTORIES = {
     "Linear Regression":    lambda s: LinearRegression(),
     "Ridge Regression":     lambda s: Ridge(),
@@ -179,15 +177,11 @@ MODEL_FACTORIES = {
     "K-Nearest Neighbors":  lambda s: KNeighborsRegressor(),
 }
 
-# Models that need feature scaling (distance/magnitude sensitive)
 SCALE_MODELS = {
     "Linear Regression", "Ridge Regression", "Lasso Regression", "ElasticNet",
     "Support Vector (RBF)", "K-Nearest Neighbors",
 }
 
-# Hyperparameter search spaces for RandomizedSearchCV.
-# Keys use the pipeline step prefix "model__" so they work with Pipeline objects.
-# Models without tunable parameters (Linear Regression) are omitted.
 PARAM_GRIDS = {
     "Ridge Regression":     {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]},
     "Lasso Regression":     {"model__alpha": [0.001, 0.01, 0.1, 1.0, 10.0]},
@@ -215,37 +209,52 @@ PARAM_GRIDS = {
                              "model__metric": ["euclidean", "manhattan"]},
 }
 
-# Market baseline for each target: the betting-market's best guess at that number
 MARKET_BASELINES = {
-    "team_score": "implied",       # implied team points from moneyline/total
-    "total":      "total_line",    # over/under line
-    "result":     "spread_line",   # spread (market's predicted point diff)
+    "team_score": "implied",
+    "total":      "total_line",
+    "result":     "spread_line",
 }
 
-# Odds columns used to derive market implied probability for binary outcomes
-# total  → P(actual total > total_line)    using over_odds / under_odds
-# result → P(team covers spread)           using spread_odds / opponent_spread_odds
 PROB_ODDS = {
     "total":  ("over_odds", "under_odds"),
     "result": ("spread_odds", "opponent_spread_odds"),
 }
 
+# Ordered list of result sections the user can toggle on/off
+DISPLAY_SECTIONS = [
+    "📝 Plain English Summary",
+    "📊 Regression Metrics",
+    "🎯 Side Accuracy",
+    "🔬 Probability Quality",
+    "💰 Betting Simulation",
+    "🔍 Confidence Tiers",
+    "📈 Cross-Validation",
+    "🔧 Hyperparameters",
+    "🔵 Probability Scatter",
+    "📉 Actual vs Predicted",
+    "⭐ Feature Importance",
+    "📋 Sample Predictions",
+]
+
 
 def american_to_raw_prob(odds_arr):
-    """Convert American odds (array) to raw implied probability (includes vig)."""
     odds_arr = np.asarray(odds_arr, dtype=float)
     return np.where(odds_arr < 0, -odds_arr / (-odds_arr + 100), 100 / (odds_arr + 100))
 
 
 def remove_vig(p_side, p_other):
-    """Normalise two raw implied probabilities so they sum to 1 (removes the vig)."""
     return p_side / (p_side + p_other)
+
+
+def american_to_decimal(odds_arr):
+    odds_arr = np.asarray(odds_arr, dtype=float)
+    return np.where(odds_arr > 0, odds_arr / 100 + 1, 100 / (-odds_arr) + 1)
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Model Configuration")
 
-    # Target
     st.subheader("1. Target Variable")
     target = st.selectbox(
         "What do you want to predict?",
@@ -257,15 +266,12 @@ with st.sidebar:
         }[x],
     )
 
-    # Model type
     st.subheader("2. Model Type")
     model_name = st.selectbox("Algorithm", list(MODEL_FACTORIES.keys()))
 
-    # Train/test split
     st.subheader("3. Train / Test Split")
     test_size = st.slider("Test set size", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
 
-    # Season filter
     st.subheader("4. Season Filter")
     seasons = sorted(df["season"].dropna().unique().astype(int).tolist())
     selected_seasons = st.multiselect(
@@ -274,7 +280,6 @@ with st.sidebar:
         default=[],
     )
 
-    # Random seed — random on first load so each session builds a unique model
     st.subheader("5. Random Seed")
     if "model_seed" not in st.session_state:
         st.session_state["model_seed"] = int(np.random.randint(1, 99999))
@@ -283,7 +288,7 @@ with st.sidebar:
         seed = st.number_input(
             "Seed", min_value=1, max_value=99999,
             value=st.session_state["model_seed"], step=1,
-            help="Controls train/test split and model randomness. Same seed + same config = same model.",
+            help="Controls train/test split and model randomness.",
         )
         st.session_state["model_seed"] = int(seed)
     with btn_col:
@@ -292,29 +297,33 @@ with st.sidebar:
             st.session_state["model_seed"] = int(np.random.randint(1, 99999))
             st.rerun()
 
-    # Cross-validation
     st.subheader("6. Cross-Validation")
     cv_enabled = st.toggle("Enable cross-validation", value=True,
                            help="Evaluate model consistency across multiple folds of training data.")
     cv_folds = st.slider("CV folds", min_value=3, max_value=10, value=5,
-                         disabled=not cv_enabled,
-                         help="More folds = more reliable estimate but slower.")
+                         disabled=not cv_enabled)
 
-    # Hyperparameter tuning
     st.subheader("7. Hyperparameter Tuning")
     can_tune = model_name in PARAM_GRIDS
     tune_enabled = st.toggle(
-        "Auto-tune hyperparameters",
-        value=False,
-        disabled=not can_tune,
-        help="Searches for the best model settings using randomized search + cross-validation. "
-             "Slower but often improves accuracy." if can_tune
-             else f"{model_name} has no tunable hyperparameters.",
+        "Auto-tune hyperparameters", value=False, disabled=not can_tune,
+        help="Searches for the best model settings using randomized search + cross-validation."
+             if can_tune else f"{model_name} has no tunable hyperparameters.",
     )
     n_iter = st.slider(
         "Search iterations", min_value=10, max_value=100, value=20, step=5,
         disabled=not (tune_enabled and can_tune),
-        help="Number of random hyperparameter combinations to try. More = better search, slower runtime.",
+    )
+
+    st.subheader("8. Display Options")
+    selected_displays = st.multiselect(
+        "Metric sections to show",
+        options=DISPLAY_SECTIONS,
+        default=DISPLAY_SECTIONS,
+        help=(
+            "Choose which sections appear in the Model Results panel. "
+            "Changing this does not require retraining — results update instantly."
+        ),
     )
 
     st.divider()
@@ -323,7 +332,6 @@ with st.sidebar:
 # ── Feature selection ──────────────────────────────────────────────────────────
 st.header("Select Features")
 
-# Quick-pick buttons row
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     betting_quick = st.checkbox("All Betting Lines", value=False)
@@ -332,7 +340,6 @@ with col_b:
 with col_c:
     context_quick = st.checkbox("Game Context", value=True)
 
-# Build default selections from quick-picks
 default_features = set()
 if betting_quick:
     default_features.update(FEATURE_GROUPS.get("Betting Lines", []))
@@ -342,12 +349,10 @@ if epa_quick:
 if context_quick:
     default_features.update(FEATURE_GROUPS.get("Game Context", []))
 
-# Remove the target from defaults just in case
 default_features.discard(target)
 
 tab_labels = list(FEATURE_GROUPS.keys()) + ["All Numeric"]
 tabs = st.tabs(tab_labels)
-
 selected_features = set()
 
 for tab, (group_name, group_cols) in zip(tabs[:-1], FEATURE_GROUPS.items()):
@@ -355,7 +360,6 @@ for tab, (group_name, group_cols) in zip(tabs[:-1], FEATURE_GROUPS.items()):
         if not group_cols:
             st.caption("No columns available for this group.")
             continue
-        # filter out the current target
         available = [c for c in group_cols if c != target]
         defaults = [c for c in available if c in default_features]
         chosen = st.multiselect(
@@ -376,7 +380,6 @@ with tabs[-1]:
     )
     selected_features.update(extra)
 
-# Consolidated review — lets users see all selected features and remove any
 all_selected_sorted = sorted(selected_features)
 if all_selected_sorted:
     st.markdown("**Selected Features** — click × on any tag to remove it:")
@@ -396,12 +399,10 @@ st.divider()
 train_btn = st.button("🚀 Train Model", type="primary", disabled=len(feature_list) == 0)
 
 if train_btn:
-    # Apply season filter
     data = df.copy()
     if selected_seasons:
         data = data[data["season"].isin(selected_seasons)]
 
-    # Stash baseline + odds columns before we narrow the columns (so they survive dropna on features)
     baseline_col = MARKET_BASELINES.get(target)
     baseline_full = data[baseline_col].copy() if baseline_col and baseline_col in data.columns else None
     odds_full = {
@@ -410,7 +411,6 @@ if train_btn:
         if c in data.columns
     }
 
-    # Drop rows missing the target or any selected feature
     cols_needed = feature_list + [target]
     data = data[cols_needed].dropna()
 
@@ -425,7 +425,6 @@ if train_btn:
         X, y, test_size=test_size, random_state=seed
     )
 
-    # Build pipeline — scaler is part of the pipeline so CV folds are leak-free
     base_model = MODEL_FACTORIES[model_name](seed)
     steps = [("model", base_model)]
     if model_name in SCALE_MODELS:
@@ -436,57 +435,43 @@ if train_btn:
     cv_results  = None
     kf = KFold(n_splits=cv_folds, shuffle=True, random_state=seed)
 
-    # ── Hyperparameter tuning ────────────────────────────────────────────────────
+    # ── Hyperparameter tuning ─────────────────────────────────────────────────
     if tune_enabled and model_name in PARAM_GRIDS:
-        with st.spinner(
-            f"Tuning {model_name} — {n_iter} iterations × {cv_folds}-fold CV …"
-        ):
+        with st.spinner(f"Tuning {model_name} — {n_iter} iterations × {cv_folds}-fold CV …"):
             search = RandomizedSearchCV(
-                pipeline,
-                PARAM_GRIDS[model_name],
-                n_iter=n_iter,
-                cv=kf,
+                pipeline, PARAM_GRIDS[model_name],
+                n_iter=n_iter, cv=kf,
                 scoring="neg_mean_absolute_error",
-                random_state=seed,
-                n_jobs=-1,
-                refit=True,
+                random_state=seed, n_jobs=-1, refit=True,
             )
             search.fit(X_train, y_train)
-        pipeline   = search.best_estimator_
-        best_params = {
-            k.replace("model__", ""): v for k, v in search.best_params_.items()
-        }
+        pipeline    = search.best_estimator_
+        best_params = {k.replace("model__", ""): v for k, v in search.best_params_.items()}
     else:
         pipeline.fit(X_train, y_train)
 
-    # ── Cross-validation (always on training data, with final pipeline config) ───
+    # ── Cross-validation ──────────────────────────────────────────────────────
     if cv_enabled:
         with st.spinner(f"Running {cv_folds}-fold cross-validation …"):
-            rmse_scores = -cross_val_score(
-                pipeline, X_train, y_train, cv=kf,
-                scoring="neg_root_mean_squared_error",
-            )
-            mae_scores = -cross_val_score(
-                pipeline, X_train, y_train, cv=kf,
-                scoring="neg_mean_absolute_error",
-            )
-            r2_scores = cross_val_score(
-                pipeline, X_train, y_train, cv=kf, scoring="r2",
-            )
-        cv_results = {
-            "folds":     cv_folds,
-            "rmse":      rmse_scores,
-            "mae":       mae_scores,
-            "r2":        r2_scores,
-        }
+            rmse_cv = -cross_val_score(pipeline, X_train, y_train, cv=kf,
+                                       scoring="neg_root_mean_squared_error")
+            mae_cv  = -cross_val_score(pipeline, X_train, y_train, cv=kf,
+                                       scoring="neg_mean_absolute_error")
+            r2_cv   =  cross_val_score(pipeline, X_train, y_train, cv=kf,
+                                       scoring="r2")
+        cv_results = {"folds": cv_folds, "rmse": rmse_cv, "mae": mae_cv, "r2": r2_cv}
 
     y_pred = pipeline.predict(X_test)
 
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
+    # ── Regression metrics ────────────────────────────────────────────────────
+    rmse     = np.sqrt(mean_squared_error(y_test, y_pred))
+    mae      = mean_absolute_error(y_test, y_pred)
+    r2       = r2_score(y_test, y_pred)
+    med_ae   = median_absolute_error(y_test, y_pred)
+    max_err  = max_error(y_test, y_pred)
+    expl_var = explained_variance_score(y_test, y_pred)
 
-    # ── Market baseline regression metrics ──────────────────────────────────────
+    # ── Market baseline regression ────────────────────────────────────────────
     b_rmse = b_mae = b_r2 = None
     if baseline_full is not None:
         baseline_test = baseline_full.loc[y_test.index]
@@ -498,7 +483,7 @@ if train_btn:
             b_mae  = mean_absolute_error(yt, bt)
             b_r2   = r2_score(yt, bt)
 
-    # ── Probability scoring (total / result only) ────────────────────────────────
+    # ── Probability metrics (total / result only) ─────────────────────────────
     prob_results = None
     prob_cols = PROB_ODDS.get(target, ())
     if baseline_full is not None and len(prob_cols) == 2 and all(c in odds_full for c in prob_cols):
@@ -508,22 +493,15 @@ if train_btn:
         o2_test   = odds_full[o2_col].loc[y_test.index]
         valid_prob = line_test.notna() & o1_test.notna() & o2_test.notna()
 
-        # Residual std from training predictions (used for probability conversion)
         train_resid_std = max(np.std(y_train.values - pipeline.predict(X_train)), 0.01)
 
-        # P(Over/Cover) for ALL test rows that have a valid line — used in sample table
-        # For total:  P(actual > total_line)       → effective threshold = +line
-        # For result: P(result + spread_line > 0)  → effective threshold = -line
-        #   (spread_line is negative for favorites in nflfastR, so -spread_line
-        #    is the points the team must WIN by to cover)
+        # P(Over/Cover) for all test rows with a valid line (for sample table)
         model_prob_full = pd.Series(np.nan, index=y_test.index)
-        line_notnull = line_test.notna()
-        line_vals_full = line_test[line_notnull].values
-        eff_line_full  = line_vals_full if target == "total" else -line_vals_full
+        line_notnull    = line_test.notna()
+        line_vals_full  = line_test[line_notnull].values
+        eff_line_full   = line_vals_full if target == "total" else -line_vals_full
         model_prob_full.loc[line_notnull[line_notnull].index] = np.clip(
-            norm.cdf(
-                (y_pred[line_notnull.values] - eff_line_full) / train_resid_std
-            ),
+            norm.cdf((y_pred[line_notnull.values] - eff_line_full) / train_resid_std),
             1e-6, 1 - 1e-6,
         )
 
@@ -532,22 +510,83 @@ if train_btn:
             o1_v   = o1_test[valid_prob].values
             o2_v   = o2_test[valid_prob].values
             y_v    = y_test[valid_prob].values
-            p_v    = y_pred[valid_prob.values]   # positional mask into numpy array
+            p_v    = y_pred[valid_prob.values]
 
-            # Effective threshold for each target:
-            #   total  → over if actual > total_line
-            #   result → cover if result > -spread_line  (result + spread_line > 0)
-            eff_line = line_v if target == "total" else -line_v
+            eff_line  = line_v if target == "total" else -line_v
+            y_binary  = (y_v > eff_line).astype(int)
 
-            y_binary = (y_v > eff_line).astype(int)
-
-            # Market no-vig probability for "side 1"
             raw_p1      = american_to_raw_prob(o1_v)
             raw_p2      = american_to_raw_prob(o2_v)
             market_prob = np.clip(remove_vig(raw_p1, raw_p2), 1e-6, 1 - 1e-6)
             model_prob  = np.clip(norm.cdf((p_v - eff_line) / train_resid_std), 1e-6, 1 - 1e-6)
 
             side1_label = "Over" if target == "total" else "Cover"
+
+            # ── Probability quality ───────────────────────────────────────────
+            brier_model  = float(brier_score_loss(y_binary, model_prob))
+            brier_market = float(brier_score_loss(y_binary, market_prob))
+            logloss_model  = float(log_loss(y_binary, model_prob))
+            logloss_market = float(log_loss(y_binary, market_prob))
+            try:
+                roc_auc_m   = float(roc_auc_score(y_binary, model_prob))
+                roc_auc_mkt = float(roc_auc_score(y_binary, market_prob))
+            except ValueError:
+                roc_auc_m = roc_auc_mkt = None
+
+            # ── Flat bet simulation (bet when model has edge over market) ─────
+            over_dec  = american_to_decimal(o1_v)
+            under_dec = american_to_decimal(o2_v)
+            bet_over  = model_prob > market_prob
+            bet_under = model_prob < market_prob
+            over_wins  = y_binary == 1
+            under_wins = y_binary == 0
+
+            pnl = np.zeros(len(model_prob))
+            pnl[bet_over  &  over_wins] =  over_dec[bet_over  &  over_wins] - 1
+            pnl[bet_over  & ~over_wins] = -1.0
+            pnl[bet_under & under_wins] =  under_dec[bet_under & under_wins] - 1
+            pnl[bet_under & ~under_wins] = -1.0
+
+            edge_mask = bet_over | bet_under
+            n_bets = int(edge_mask.sum())
+            if n_bets > 0:
+                flat_roi_pct  = float(pnl[edge_mask].sum() / n_bets * 100)
+                flat_win_rate = float(
+                    ((bet_over & over_wins) | (bet_under & under_wins)).sum() / n_bets
+                )
+                avg_edge = float((model_prob[edge_mask] - market_prob[edge_mask]).mean())
+                # Kelly fraction for each edge bet
+                kelly_vals = []
+                if bet_over.any():
+                    b = over_dec[bet_over]
+                    p = model_prob[bet_over]
+                    kelly_vals.extend(np.clip((p * b - 1) / (b - 1), 0, None).tolist())
+                if bet_under.any():
+                    b = under_dec[bet_under]
+                    p = 1 - model_prob[bet_under]
+                    kelly_vals.extend(np.clip((p * b - 1) / (b - 1), 0, None).tolist())
+                avg_kelly = float(np.mean(kelly_vals)) if kelly_vals else 0.0
+            else:
+                flat_roi_pct = flat_win_rate = avg_edge = avg_kelly = None
+
+            # ── Confidence tier accuracy ──────────────────────────────────────
+            confidence_tiers = []
+            for thresh in [0.50, 0.55, 0.60, 0.65, 0.70]:
+                mask = (model_prob > thresh) | (model_prob < (1 - thresh))
+                n_t  = int(mask.sum())
+                if n_t > 0:
+                    acc = float(((model_prob[mask] > 0.5) == y_binary[mask]).mean())
+                    label = (
+                        "All games" if thresh == 0.50
+                        else f"≥{thresh:.0%} confidence"
+                    )
+                    confidence_tiers.append({
+                        "Threshold": label,
+                        "Games": n_t,
+                        "Accuracy": acc,
+                        "Accuracy (%)": round(acc * 100, 1),
+                    })
+
             prob_results = dict(
                 n=int(valid_prob.sum()),
                 side1_label=side1_label,
@@ -558,387 +597,91 @@ if train_btn:
                 train_resid_std=train_resid_std,
                 pct_correct_model=float(np.mean((model_prob > 0.5) == y_binary)),
                 pct_correct_market=float(np.mean((market_prob > 0.5) == y_binary)),
+                # Probability quality
+                brier_model=brier_model, brier_market=brier_market,
+                logloss_model=logloss_model, logloss_market=logloss_market,
+                roc_auc_m=roc_auc_m, roc_auc_mkt=roc_auc_mkt,
+                # Betting simulation
+                n_bets=n_bets,
+                flat_roi_pct=flat_roi_pct,
+                flat_win_rate=flat_win_rate,
+                avg_edge=avg_edge,
+                avg_kelly=avg_kelly,
+                # Confidence tiers
+                confidence_tiers=confidence_tiers,
             )
 
-    # ── Results layout ──────────────────────────────────────────────────────────
-    st.header("📊 Model Results")
-    st.caption(
-        f"**{model_name}** · Target: `{target}` · "
-        f"Train rows: {len(X_train):,} · Test rows: {len(X_test):,} · "
-        f"Seed: `{seed}`"
-    )
-
-    # ── Plain English Summary ────────────────────────────────────────────────────
-    summary_lines = []
-    summary_lines.append(
-        f"Your **{model_name}** was trained to predict **{target}** using "
-        f"**{len(feature_list)} feature(s)** and evaluated on **{len(y_test):,} held-out games**."
-    )
-
-    if target == "team_score" and b_mae is not None:
-        edge = b_mae - mae
-        direction = "better" if edge > 0 else "worse"
-        summary_lines.append(
-            f"On average the model's score predictions were off by **{mae:.2f} points**, "
-            f"compared to the market's implied score being off by **{b_mae:.2f} points** — "
-            f"the model is **{abs(edge):.2f} points {direction}** than the market."
-        )
-        if edge > 0:
-            summary_lines.append(
-                "The model is adding predictive information on top of what the market already prices in. "
-                "That's a promising signal for building value bets around team scoring."
-            )
-        else:
-            summary_lines.append(
-                "The market implied score is still more accurate than the model. "
-                "This suggests stronger features or more data are needed to overcome the market."
-            )
-
-    if prob_results is not None:
-        side = prob_results["side1_label"].lower()
-        acc_m   = prob_results["pct_correct_model"]  * 100
-        acc_mkt = prob_results["pct_correct_market"] * 100
-        edge    = acc_m - acc_mkt
-        beat    = acc_m > acc_mkt
-        summary_lines.append(
-            f"The model's numerical predictions were converted to a probability of going "
-            f"**{side}** the line (residual std = {prob_results['train_resid_std']:.2f} points). "
-            f"A game is graded correct when the model predicted {side} (P > 50%) and it hit, "
-            f"**or** predicted {('Under' if side == 'over' else 'No Cover')} (P < 50%) and it hit. "
-            f"Across {prob_results['n']:,} games with available odds, the model called the correct "
-            f"side **{acc_m:.1f}%** of the time vs the market's **{acc_mkt:.1f}%** — "
-            f"an edge of **{edge:+.1f} percentage points**."
-        )
-        if beat:
-            summary_lines.append(
-                f"**The model beats the market** — it correctly called the {side} side "
-                f"{edge:.1f}pp more often than the market's implied favourite. "
-                "That frequency edge is where betting value can be extracted."
-            )
-        else:
-            summary_lines.append(
-                f"**The model does not beat the market** — the market called the correct side "
-                f"{-edge:.1f}pp more often. Try adding more informative features, a different "
-                "algorithm, or more seasons of data."
-            )
-    elif b_rmse is not None and target != "team_score":
-        if rmse < b_rmse and mae < b_mae:
-            summary_lines.append(
-                "The model outperforms the market baseline on both RMSE and MAE. "
-                "Note: side-accuracy scoring was skipped because the required odds columns "
-                f"({' / '.join(PROB_ODDS.get(target, []))}) were not found in the data."
-            )
-        else:
-            summary_lines.append(
-                "The model does not outperform the market baseline on error metrics. "
-                "Consider different features or a different algorithm."
-            )
-
-    with st.expander("📝 Plain English Summary", expanded=True):
-        for line in summary_lines:
-            st.markdown(f"- {line}")
-
-    # ── Verdict banner ───────────────────────────────────────────────────────────
-    if prob_results is not None:
-        acc_m   = prob_results["pct_correct_model"]  * 100
-        acc_mkt = prob_results["pct_correct_market"] * 100
-        if acc_m > acc_mkt:
-            st.success(
-                f"**Model beats the market (side accuracy) — "
-                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
-            )
-        else:
-            st.error(
-                f"**Model does NOT beat the market (side accuracy) — "
-                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
-            )
-    elif b_rmse is not None:
-        beats_rmse = rmse < b_rmse
-        beats_mae  = mae  < b_mae
-        n_beats = sum([beats_rmse, beats_mae])
-        if n_beats == 2:
-            st.success(
-                f"**Model beats the market baseline ({baseline_col}) on both RMSE and MAE — "
-                f"RMSE: {b_rmse:.3f} → {rmse:.3f} | MAE: {b_mae:.3f} → {mae:.3f}**"
-            )
-        elif n_beats == 1:
-            st.warning(
-                f"**Model beats the market on one of two error metrics — "
-                f"RMSE: {b_rmse:.3f} → {rmse:.3f} | MAE: {b_mae:.3f} → {mae:.3f}**"
-            )
-        else:
-            st.error(
-                f"**Model does NOT beat the market baseline ({baseline_col}) — "
-                f"RMSE: {b_rmse:.3f} → {rmse:.3f} | MAE: {b_mae:.3f} → {mae:.3f}**"
-            )
-
-    # ── Probability metrics (total / result) ─────────────────────────────────────
-    if prob_results is not None:
-        acc_m   = prob_results["pct_correct_model"]  * 100
-        acc_mkt = prob_results["pct_correct_market"] * 100
-        st.markdown("#### Side Accuracy vs Market")
-        pc1, pc2, pc3 = st.columns(3)
-        pc1.metric(
-            "Model Side Accuracy",
-            f"{acc_m:.1f}%",
-            delta=f"{acc_m - acc_mkt:+.1f}pp vs market",
-            delta_color="normal",
-            help=(
-                f"% of games where the model predicted the correct side — "
-                f"P({prob_results['side1_label']}) > 50% and {prob_results['side1_label']} hit, "
-                f"OR P({prob_results['side1_label']}) < 50% and Under/No Cover hit."
-            ),
-        )
-        pc2.metric(
-            "Market Side Accuracy",
-            f"{acc_mkt:.1f}%",
-            help=(
-                "% of games where the market's no-vig implied favourite was correct — "
-                "market P > 50% and that side hit, or market P < 50% and the other side hit."
-            ),
-        )
-        pc3.metric(
-            "Games Evaluated",
-            f"{prob_results['n']:,}",
-            help="Test-set games where both the line and odds were available.",
-        )
-
-    # ── Regression metrics vs market ─────────────────────────────────────────────
-    st.markdown("#### Regression Accuracy vs Market")
-    if b_rmse is not None:
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric(
-            "R²", f"{r2:.4f}",
-            delta=f"{r2 - b_r2:+.4f} vs market", delta_color="normal",
-            help="Higher is better.",
-        )
-        mc2.metric(
-            "RMSE", f"{rmse:.3f}",
-            delta=f"{rmse - b_rmse:+.3f} vs market", delta_color="inverse",
-            help="Lower is better — negative delta means model wins.",
-        )
-        mc3.metric(
-            "MAE", f"{mae:.3f}",
-            delta=f"{mae - b_mae:+.3f} vs market", delta_color="inverse",
-            help="Lower is better — negative delta means model wins.",
-        )
-    else:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("R² Score", f"{r2:.4f}", help="1.0 = perfect; 0 = no better than the mean.")
-        m2.metric("RMSE", f"{rmse:.3f}", help="Root Mean Squared Error (same units as target).")
-        m3.metric("MAE", f"{mae:.3f}", help="Mean Absolute Error (same units as target).")
-
-    # ── Cross-validation results ──────────────────────────────────────────────────
-    if cv_results is not None:
-        r = cv_results
-        rmse_cv, mae_cv, r2_cv = r["rmse"], r["mae"], r["r2"]
-        cv_stable = (rmse_cv.std() / rmse_cv.mean()) < 0.10  # <10% CoV = stable
-
-        st.markdown("#### Cross-Validation Results (training data)")
-        if cv_stable:
-            st.success(
-                f"**Model is stable** — RMSE varied by less than 10% across folds "
-                f"(CV: {rmse_cv.mean():.3f} ± {rmse_cv.std():.3f})"
-            )
-        else:
-            st.warning(
-                f"**Model shows variance across folds** — RMSE CoV "
-                f"{rmse_cv.std()/rmse_cv.mean()*100:.1f}%. "
-                "Consider more data, fewer features, or stronger regularisation."
-            )
-
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.metric(
-            "CV RMSE", f"{rmse_cv.mean():.3f}",
-            delta=f"±{rmse_cv.std():.3f} std",
-            delta_color="off",
-            help="Mean RMSE across all CV folds (lower is better).",
-        )
-        cc2.metric(
-            "CV MAE", f"{mae_cv.mean():.3f}",
-            delta=f"±{mae_cv.std():.3f} std",
-            delta_color="off",
-            help="Mean MAE across all CV folds (lower is better).",
-        )
-        cc3.metric(
-            "CV R²", f"{r2_cv.mean():.4f}",
-            delta=f"±{r2_cv.std():.4f} std",
-            delta_color="off",
-            help="Mean R² across all CV folds (higher is better).",
-        )
-
-        fold_df = pd.DataFrame({
-            "Fold":  [f"Fold {i+1}" for i in range(r["folds"])],
-            "RMSE":  rmse_cv,
-            "MAE":   mae_cv,
-            "R²":    r2_cv,
-        })
-        fig_cv = px.bar(
-            fold_df, x="Fold", y="RMSE",
-            title=f"{r['folds']}-Fold CV — RMSE per Fold",
-            color="RMSE",
-            color_continuous_scale="Blues_r",
-            text=fold_df["RMSE"].round(3),
-        )
-        fig_cv.add_hline(
-            y=rmse_cv.mean(), line_dash="dash", line_color="#00AEEF",
-            annotation_text=f"Mean {rmse_cv.mean():.3f}",
-        )
-        fig_cv.update_traces(textposition="outside")
-        fig_cv.update_layout(showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig_cv, use_container_width=True)
-
-    # ── Best hyperparameters (if tuned) ──────────────────────────────────────────
-    if best_params is not None:
-        with st.expander("🔧 Auto-Tuned Hyperparameters", expanded=False):
-            st.caption(
-                f"Best parameters found by RandomizedSearchCV "
-                f"({n_iter} iterations, {cv_folds}-fold CV, scored on MAE)."
-            )
-            params_df = pd.DataFrame(
-                list(best_params.items()), columns=["Parameter", "Value"]
-            )
-            st.dataframe(params_df, use_container_width=True, hide_index=True)
-
-    # ── Model vs Market probability scatter ──────────────────────────────────────
-    if prob_results is not None:
-        st.markdown("#### Model vs Market Probability (each dot = one game)")
-        outcome_labels = {
-            "1": prob_results["side1_label"],
-            "0": f"Under / No Cover",
-        }
-        prob_df = pd.DataFrame({
-            "Market P(Over/Cover)": prob_results["market_prob"],
-            "Model P(Over/Cover)":  prob_results["model_prob"],
-            "Outcome": pd.Series(prob_results["y_binary"]).astype(str).map(outcome_labels),
-        })
-        fig_prob = px.scatter(
-            prob_df,
-            x="Market P(Over/Cover)",
-            y="Model P(Over/Cover)",
-            color="Outcome",
-            opacity=0.55,
-            color_discrete_map={
-                prob_results["side1_label"]: "#2ca02c",
-                "Under / No Cover": "#d62728",
-            },
-            title="Where model and market agree — and where they diverge",
-        )
-        fig_prob.add_shape(
-            type="line", x0=0, y0=0, x1=1, y1=1,
-            line=dict(color="gray", dash="dash"),
-        )
-        fig_prob.add_hline(y=0.5, line_dash="dot", line_color="lightgray")
-        fig_prob.add_vline(x=0.5, line_dash="dot", line_color="lightgray")
-        fig_prob.update_layout(xaxis_range=[0, 1], yaxis_range=[0, 1])
-        st.plotly_chart(fig_prob, use_container_width=True)
-        st.caption(
-            "Dots above the diagonal = model is more confident than the market. "
-            "Top-left / bottom-right quadrants = model and market disagree — that's where potential edge lives."
-        )
-
-    col_left, col_right = st.columns(2)
-
-    # Actual vs Predicted
-    with col_left:
-        fig_scatter = px.scatter(
-            x=y_test,
-            y=y_pred,
-            labels={"x": f"Actual {target}", "y": f"Predicted {target}"},
-            title="Actual vs. Predicted",
-            opacity=0.6,
-            color_discrete_sequence=["#1f77b4"],
-        )
-        mn = min(y_test.min(), y_pred.min())
-        mx = max(y_test.max(), y_pred.max())
-        fig_scatter.add_trace(
-            go.Scatter(x=[mn, mx], y=[mn, mx], mode="lines",
-                       line=dict(color="red", dash="dash"), name="Perfect fit")
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    # Residuals
-    with col_right:
-        residuals = y_test.values - y_pred
-        fig_resid = px.histogram(
-            residuals,
-            nbins=40,
-            labels={"value": "Residual", "count": "Frequency"},
-            title="Residuals Distribution",
-            color_discrete_sequence=["#ff7f0e"],
-        )
-        fig_resid.add_vline(x=0, line_dash="dash", line_color="red")
-        st.plotly_chart(fig_resid, use_container_width=True)
-
-    # Feature importance / coefficients
-    st.subheader("Feature Importance / Coefficients")
-    fitted_model = pipeline.named_steps["model"]
-
+    # ── Feature importance DataFrames ─────────────────────────────────────────
+    fitted_model  = pipeline.named_steps["model"]
+    coef_df_store = imp_df_store = None
     if hasattr(fitted_model, "coef_"):
-        coef_df = pd.DataFrame({
+        coef_df_store = pd.DataFrame({
             "Feature": feature_list,
             "Coefficient": fitted_model.coef_,
         }).sort_values("Coefficient", key=abs, ascending=False)
-        fig_coef = px.bar(
-            coef_df,
-            x="Coefficient",
-            y="Feature",
-            orientation="h",
-            title="Model Coefficients (scaled)",
-            color="Coefficient",
-            color_continuous_scale="RdBu",
-            color_continuous_midpoint=0,
-        )
-        fig_coef.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_coef, use_container_width=True)
-
     elif hasattr(fitted_model, "feature_importances_"):
-        imp_df = pd.DataFrame({
+        imp_df_store = pd.DataFrame({
             "Feature": feature_list,
             "Importance": fitted_model.feature_importances_,
         }).sort_values("Importance", ascending=False)
-        fig_imp = px.bar(
-            imp_df,
-            x="Importance",
-            y="Feature",
-            orientation="h",
-            title="Feature Importance",
-            color="Importance",
-            color_continuous_scale="Blues",
-        )
-        fig_imp.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_imp, use_container_width=True)
 
-    # Prediction table sample
-    st.subheader("Sample Predictions")
-    sample = X_test.copy().reset_index(drop=True).head(20)
-    sample["Actual"] = y_test.values[:20]
-    sample["Predicted"] = np.round(y_pred[:20], 2)
-    sample["Error"] = np.round(sample["Actual"] - sample["Predicted"], 2)
+    # ── Sample predictions ────────────────────────────────────────────────────
+    sample_df = X_test.copy().reset_index(drop=True).head(20)
+    sample_df["Actual"]    = y_test.values[:20]
+    sample_df["Predicted"] = np.round(y_pred[:20], 2)
+    sample_df["Error"]     = np.round(sample_df["Actual"] - sample_df["Predicted"], 2)
     if prob_results is not None:
-        prob_col_label = f"P({prob_results['side1_label']})"
-        sample[prob_col_label] = (
+        pcol = f"P({prob_results['side1_label']})"
+        sample_df[pcol] = (
             prob_results["model_prob_full"].reset_index(drop=True)[:20].round(3).values
         )
-    st.dataframe(sample, use_container_width=True)
 
-    # Download predictions
     pred_df = X_test.copy().reset_index(drop=True)
-    pred_df["Actual"] = y_test.values
+    pred_df["Actual"]    = y_test.values
     pred_df["Predicted"] = np.round(y_pred, 2)
-    pred_df["Error"] = pred_df["Actual"] - pred_df["Predicted"]
+    pred_df["Error"]     = pred_df["Actual"] - pred_df["Predicted"]
     if prob_results is not None:
-        prob_col_label = f"P({prob_results['side1_label']})"
-        pred_df[prob_col_label] = prob_results["model_prob_full"].reset_index(drop=True).round(3).values
+        pcol = f"P({prob_results['side1_label']})"
+        pred_df[pcol] = (
+            prob_results["model_prob_full"].reset_index(drop=True).round(3).values
+        )
     csv_out = pred_df.to_csv(index=False).encode()
-    st.download_button(
-        "⬇️ Download Predictions CSV",
-        data=csv_out,
-        file_name=f"nfl_predictions_{target}_{model_name.replace(' ', '_')}.csv",
-        mime="text/csv",
-    )
 
-    # Persist the trained model so the prediction section survives reruns
+    # ── Persist everything ────────────────────────────────────────────────────
+    st.session_state["results"] = {
+        "model_name":   model_name,
+        "target":       target,
+        "seed":         seed,
+        "n_train":      len(X_train),
+        "n_test":       len(X_test),
+        "feature_list": list(feature_list),
+        "n_iter":       n_iter,
+        "cv_folds":     cv_folds,
+        # Regression metrics
+        "rmse": rmse, "mae": mae, "r2": r2,
+        "med_ae": med_ae, "max_err": max_err, "expl_var": expl_var,
+        # Market baseline
+        "b_rmse": b_rmse, "b_mae": b_mae, "b_r2": b_r2,
+        "baseline_col": baseline_col,
+        # Probability / betting metrics
+        "prob": prob_results,
+        # CV
+        "cv": cv_results,
+        # Hyperparams
+        "best_params": best_params,
+        # Chart data
+        "y_test": y_test.values,
+        "y_pred": y_pred,
+        # Feature importance
+        "coef_df": coef_df_store,
+        "imp_df":  imp_df_store,
+        # Tables & download
+        "sample_df":    sample_df,
+        "csv_out":      csv_out,
+        "csv_filename": f"nfl_predictions_{target}_{model_name.replace(' ', '_')}.csv",
+    }
+
+    # Persist trained pipeline for "Predict on New Data" section
     st.session_state["trained_pipeline"]     = pipeline
     st.session_state["trained_features"]     = feature_list
     st.session_state["trained_target"]       = target
@@ -949,6 +692,463 @@ if train_btn:
         prob_results["side1_label"] if prob_results else None
     )
     st.session_state["trained_baseline_col"] = baseline_col
+
+# ── Model Results Display ──────────────────────────────────────────────────────
+if "results" in st.session_state:
+    res  = st.session_state["results"]
+    prob = res.get("prob")
+    show = set(selected_displays)   # which sections to render
+
+    st.header("📊 Model Results")
+    st.caption(
+        f"**{res['model_name']}** · Target: `{res['target']}` · "
+        f"Train rows: {res['n_train']:,} · Test rows: {res['n_test']:,} · "
+        f"Seed: `{res['seed']}`"
+    )
+
+    # ── Plain English Summary ─────────────────────────────────────────────────
+    if "📝 Plain English Summary" in show:
+        sl = []  # summary_lines
+        sl.append(
+            f"Your **{res['model_name']}** was trained to predict **{res['target']}** using "
+            f"**{len(res['feature_list'])} feature(s)** and evaluated on **{res['n_test']:,} held-out games**."
+        )
+
+        if res["target"] == "team_score" and res["b_mae"] is not None:
+            edge = res["b_mae"] - res["mae"]
+            sl.append(
+                f"On average the model's score predictions were off by **{res['mae']:.2f} points**, "
+                f"compared to the market's implied score being off by **{res['b_mae']:.2f} points** — "
+                f"the model is **{abs(edge):.2f} points {'better' if edge > 0 else 'worse'}** than the market."
+            )
+            sl.append(
+                "The model is adding predictive information on top of what the market already prices in. "
+                "That's a promising signal for building value bets around team scoring."
+                if edge > 0 else
+                "The market implied score is still more accurate than the model. "
+                "Stronger features or more data are needed to overcome the market."
+            )
+
+        if prob is not None:
+            side    = prob["side1_label"].lower()
+            acc_m   = prob["pct_correct_model"]  * 100
+            acc_mkt = prob["pct_correct_market"] * 100
+            edge    = acc_m - acc_mkt
+            sl.append(
+                f"The model's numerical predictions were converted to a probability of going "
+                f"**{side}** the line (residual std = {prob['train_resid_std']:.2f} pts). "
+                f"A game is graded correct when the model predicted {side} (P > 50%) and it hit, "
+                f"**or** predicted {'Under' if side == 'over' else 'No Cover'} (P < 50%) and it hit. "
+                f"Across {prob['n']:,} games the model was correct **{acc_m:.1f}%** of the time "
+                f"vs the market's **{acc_mkt:.1f}%** — an edge of **{edge:+.1f}pp**."
+            )
+            # Probability quality narrative
+            brier_delta = prob["brier_market"] - prob["brier_model"]
+            ll_delta    = prob["logloss_market"] - prob["logloss_model"]
+            qual_parts  = []
+            qual_parts.append(
+                f"{'better' if brier_delta > 0 else 'worse'} calibrated "
+                f"(Brier: {prob['brier_model']:.4f} vs market {prob['brier_market']:.4f})"
+            )
+            qual_parts.append(
+                f"{'lower' if ll_delta > 0 else 'higher'} log loss "
+                f"({prob['logloss_model']:.4f} vs market {prob['logloss_market']:.4f})"
+            )
+            if prob.get("roc_auc_m") is not None:
+                qual_parts.append(f"ROC-AUC of {prob['roc_auc_m']:.4f}")
+            sl.append(
+                "In terms of probability quality the model has **" +
+                "**, **".join(qual_parts) + "**."
+            )
+            # Flat bet narrative
+            if prob.get("flat_roi_pct") is not None:
+                sl.append(
+                    f"Simulating flat bets on the **{prob['n_bets']:,} games** where the model "
+                    f"had an edge over the closing odds yields a "
+                    f"**{'profit' if prob['flat_roi_pct'] >= 0 else 'loss'} of "
+                    f"{abs(prob['flat_roi_pct']):.1f}% ROI** "
+                    f"(win rate {prob['flat_win_rate']*100:.1f}%, "
+                    f"avg Kelly {prob['avg_kelly']*100:.2f}%)."
+                )
+            sl.append(
+                f"**The model beats the market** — it correctly called the {side} side "
+                f"{edge:.1f}pp more often. That frequency edge is where betting value is extracted."
+                if acc_m > acc_mkt else
+                f"**The model does not beat the market** — the market called the correct side "
+                f"{-edge:.1f}pp more often. Try different features, algorithm, or more seasons."
+            )
+        elif res["b_rmse"] is not None and res["target"] != "team_score":
+            sl.append(
+                "The model outperforms the market baseline on both RMSE and MAE."
+                if res["rmse"] < res["b_rmse"] and res["mae"] < res["b_mae"] else
+                "The model does not outperform the market baseline on error metrics."
+            )
+
+        with st.expander("📝 Plain English Summary", expanded=True):
+            for line in sl:
+                st.markdown(f"- {line}")
+
+    # ── Verdict banner (always shown) ─────────────────────────────────────────
+    if prob is not None:
+        acc_m   = prob["pct_correct_model"]  * 100
+        acc_mkt = prob["pct_correct_market"] * 100
+        if acc_m > acc_mkt:
+            st.success(
+                f"**Model beats the market (side accuracy) — "
+                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
+            )
+        else:
+            st.error(
+                f"**Model does NOT beat the market (side accuracy) — "
+                f"Model: {acc_m:.1f}% | Market: {acc_mkt:.1f}%**"
+            )
+    elif res["b_rmse"] is not None:
+        beats_rmse = res["rmse"] < res["b_rmse"]
+        beats_mae  = res["mae"]  < res["b_mae"]
+        n_beats    = sum([beats_rmse, beats_mae])
+        bc         = res["baseline_col"]
+        if n_beats == 2:
+            st.success(
+                f"**Model beats {bc} on both RMSE and MAE — "
+                f"RMSE: {res['b_rmse']:.3f} → {res['rmse']:.3f} | "
+                f"MAE: {res['b_mae']:.3f} → {res['mae']:.3f}**"
+            )
+        elif n_beats == 1:
+            st.warning(
+                f"**Model beats {bc} on one of two error metrics — "
+                f"RMSE: {res['b_rmse']:.3f} → {res['rmse']:.3f} | "
+                f"MAE: {res['b_mae']:.3f} → {res['mae']:.3f}**"
+            )
+        else:
+            st.error(
+                f"**Model does NOT beat {bc} — "
+                f"RMSE: {res['b_rmse']:.3f} → {res['rmse']:.3f} | "
+                f"MAE: {res['b_mae']:.3f} → {res['mae']:.3f}**"
+            )
+
+    # ── Side Accuracy ─────────────────────────────────────────────────────────
+    if "🎯 Side Accuracy" in show and prob is not None:
+        acc_m   = prob["pct_correct_model"]  * 100
+        acc_mkt = prob["pct_correct_market"] * 100
+        st.markdown("#### 🎯 Side Accuracy vs Market")
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric(
+            "Model Side Accuracy", f"{acc_m:.1f}%",
+            delta=f"{acc_m - acc_mkt:+.1f}pp vs market", delta_color="normal",
+            help=(
+                f"% of games where the model predicted the correct side — "
+                f"P({prob['side1_label']}) > 50% and {prob['side1_label']} hit, "
+                f"OR P({prob['side1_label']}) < 50% and Under/No Cover hit."
+            ),
+        )
+        pc2.metric(
+            "Market Side Accuracy", f"{acc_mkt:.1f}%",
+            help=(
+                "% of games where the market's no-vig implied favourite was correct — "
+                "market P > 50% and that side hit, or market P < 50% and the other side hit."
+            ),
+        )
+        pc3.metric(
+            "Games Evaluated", f"{prob['n']:,}",
+            help="Test-set games where both the line and odds were available.",
+        )
+
+    # ── Probability Quality ───────────────────────────────────────────────────
+    if "🔬 Probability Quality" in show and prob is not None:
+        st.markdown("#### 🔬 Probability Quality")
+        st.caption(
+            "These metrics measure how well-calibrated the model's probability outputs are — "
+            "beyond just picking the right side. "
+            "**Brier Score** = mean squared error between probability and outcome (lower is better). "
+            "**Log Loss** = penalises overconfident wrong calls more harshly (lower is better). "
+            "**ROC-AUC** = ability to rank Over vs Under outcomes across all thresholds "
+            "(higher is better; 0.50 = no skill, 1.0 = perfect)."
+        )
+        pq1, pq2, pq3, pq4, pq5 = st.columns(5)
+        pq1.metric(
+            "Brier (Model)", f"{prob['brier_model']:.4f}",
+            delta=f"{prob['brier_model'] - prob['brier_market']:+.4f} vs market",
+            delta_color="inverse",
+            help="Lower is better. 0 = perfect probability estimates.",
+        )
+        pq2.metric(
+            "Brier (Market)", f"{prob['brier_market']:.4f}",
+            help="Market no-vig probabilities used as the Brier Score baseline.",
+        )
+        pq3.metric(
+            "Log Loss (Model)", f"{prob['logloss_model']:.4f}",
+            delta=f"{prob['logloss_model'] - prob['logloss_market']:+.4f} vs market",
+            delta_color="inverse",
+            help="Lower is better. Penalises overconfident wrong predictions.",
+        )
+        pq4.metric(
+            "Log Loss (Market)", f"{prob['logloss_market']:.4f}",
+            help="Market probabilities as Log Loss baseline.",
+        )
+        if prob.get("roc_auc_m") is not None:
+            delta_auc = (
+                f"{prob['roc_auc_m'] - prob['roc_auc_mkt']:+.4f} vs market"
+                if prob.get("roc_auc_mkt") is not None else None
+            )
+            pq5.metric(
+                "ROC-AUC (Model)", f"{prob['roc_auc_m']:.4f}",
+                delta=delta_auc, delta_color="normal",
+                help="Higher is better. Measures how well the model ranks outcomes. 0.5 = random.",
+            )
+
+    # ── Betting Simulation ────────────────────────────────────────────────────
+    if "💰 Betting Simulation" in show and prob is not None:
+        st.markdown("#### 💰 Betting Simulation")
+        st.caption(
+            f"Simulates placing a 1-unit flat bet on every game where the model's probability "
+            f"differs from the market — model > market → bet **{prob['side1_label']}**; "
+            f"model < market → bet **{'Under' if prob['side1_label'] == 'Over' else 'No Cover'}**. "
+            "Payouts use the actual market odds. "
+            "**Kelly Fraction** = recommended % of bankroll per bet based on model edge and odds."
+        )
+        if prob.get("flat_roi_pct") is not None:
+            fb1, fb2, fb3, fb4 = st.columns(4)
+            roi_color = "normal" if prob["flat_roi_pct"] >= 0 else "inverse"
+            fb1.metric(
+                "Flat Bet ROI", f"{prob['flat_roi_pct']:+.2f}%",
+                delta_color=roi_color,
+                help="Total profit ÷ total bets × 100. Positive = profitable flat-bet strategy.",
+            )
+            fb2.metric(
+                "Win Rate (Edge Bets)", f"{prob['flat_win_rate']*100:.1f}%",
+                help="% of edge bets that won. Break-even is ~52.4% at standard -110 odds.",
+            )
+            fb3.metric(
+                "Bets Placed", f"{prob['n_bets']:,}",
+                help="Games where the model had a directional edge over the market.",
+            )
+            fb4.metric(
+                "Avg Kelly Fraction", f"{prob['avg_kelly']*100:.2f}%",
+                help=(
+                    "Average recommended Kelly bet size as % of bankroll. "
+                    "Positive → model sees positive expected value. "
+                    "Most professionals use ¼ or ½ Kelly to reduce variance."
+                ),
+            )
+            if prob.get("avg_edge") is not None:
+                st.caption(
+                    f"Average edge per bet: **{prob['avg_edge']*100:+.2f}pp** "
+                    "(signed model prob − market prob toward the bet direction)"
+                )
+        else:
+            st.info("Not enough games with model edge to simulate bets.")
+
+    # ── Confidence Tiers ──────────────────────────────────────────────────────
+    if "🔍 Confidence Tiers" in show and prob is not None and prob.get("confidence_tiers"):
+        st.markdown("#### 🔍 Accuracy by Confidence Tier")
+        st.caption(
+            "Filters the test set to games where the model is increasingly confident "
+            "(further from 50%). A well-calibrated model should be more accurate at higher "
+            "confidence levels. The break-even win rate at standard -110 odds is ~52.4%."
+        )
+        tier_df = pd.DataFrame(prob["confidence_tiers"])
+        fig_tier = px.bar(
+            tier_df, x="Threshold", y="Accuracy (%)",
+            text=tier_df["Accuracy (%)"].astype(str) + "%",
+            color="Accuracy (%)",
+            color_continuous_scale="RdYlGn",
+            range_color=[40, 70],
+            title="Model Accuracy at Each Confidence Threshold",
+        )
+        fig_tier.add_hline(
+            y=52.4, line_dash="dash", line_color="#FFB300",
+            annotation_text="52.4% break-even (-110 vig)",
+        )
+        fig_tier.add_hline(y=50, line_dash="dot", line_color="gray",
+                           annotation_text="50% random")
+        fig_tier.update_traces(textposition="outside")
+        fig_tier.update_layout(coloraxis_showscale=False, xaxis_title="Confidence Filter")
+        st.plotly_chart(fig_tier, use_container_width=True)
+        st.dataframe(
+            tier_df[["Threshold", "Games", "Accuracy (%)"]],
+            use_container_width=True, hide_index=True,
+        )
+
+    # ── Regression Metrics ────────────────────────────────────────────────────
+    if "📊 Regression Metrics" in show:
+        st.markdown("#### 📊 Regression Accuracy vs Market")
+        if res["b_rmse"] is not None:
+            mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+            mc1.metric("R²", f"{res['r2']:.4f}",
+                       delta=f"{res['r2'] - res['b_r2']:+.4f} vs market",
+                       delta_color="normal",
+                       help="Higher is better. 1.0 = perfect.")
+            mc2.metric("RMSE", f"{res['rmse']:.3f}",
+                       delta=f"{res['rmse'] - res['b_rmse']:+.3f} vs market",
+                       delta_color="inverse",
+                       help="Root Mean Squared Error — lower is better.")
+            mc3.metric("MAE", f"{res['mae']:.3f}",
+                       delta=f"{res['mae'] - res['b_mae']:+.3f} vs market",
+                       delta_color="inverse",
+                       help="Mean Absolute Error — lower is better.")
+            mc4.metric("Median AE", f"{res['med_ae']:.3f}",
+                       help="More robust to outlier games than MAE.")
+            mc5.metric("Max Error", f"{res['max_err']:.2f}",
+                       help="Largest single prediction error. Useful for risk management.")
+            mc6.metric("Expl. Variance", f"{res['expl_var']:.4f}",
+                       help="Proportion of variance explained. Similar to R² but ignores mean bias.")
+        else:
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("R²",            f"{res['r2']:.4f}")
+            m2.metric("RMSE",          f"{res['rmse']:.3f}")
+            m3.metric("MAE",           f"{res['mae']:.3f}")
+            m4.metric("Median AE",     f"{res['med_ae']:.3f}")
+            m5.metric("Max Error",     f"{res['max_err']:.2f}")
+            m6.metric("Expl. Variance",f"{res['expl_var']:.4f}")
+
+    # ── Cross-Validation ──────────────────────────────────────────────────────
+    if "📈 Cross-Validation" in show and res["cv"] is not None:
+        r       = res["cv"]
+        rmse_cv = r["rmse"]; mae_cv = r["mae"]; r2_cv = r["r2"]
+        stable  = (rmse_cv.std() / rmse_cv.mean()) < 0.10
+
+        st.markdown("#### 📈 Cross-Validation Results (training data)")
+        if stable:
+            st.success(
+                f"**Model is stable** — RMSE varied less than 10% across folds "
+                f"(CV: {rmse_cv.mean():.3f} ± {rmse_cv.std():.3f})"
+            )
+        else:
+            st.warning(
+                f"**Model shows fold-to-fold variance** — RMSE CoV "
+                f"{rmse_cv.std()/rmse_cv.mean()*100:.1f}%. "
+                "Consider more data, fewer features, or stronger regularisation."
+            )
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("CV RMSE", f"{rmse_cv.mean():.3f}",
+                   delta=f"±{rmse_cv.std():.3f} std", delta_color="off")
+        cc2.metric("CV MAE",  f"{mae_cv.mean():.3f}",
+                   delta=f"±{mae_cv.std():.3f} std", delta_color="off")
+        cc3.metric("CV R²",   f"{r2_cv.mean():.4f}",
+                   delta=f"±{r2_cv.std():.4f} std", delta_color="off")
+
+        fold_df = pd.DataFrame({
+            "Fold": [f"Fold {i+1}" for i in range(r["folds"])],
+            "RMSE": rmse_cv, "MAE": mae_cv, "R²": r2_cv,
+        })
+        fig_cv = px.bar(
+            fold_df, x="Fold", y="RMSE",
+            title=f"{r['folds']}-Fold CV — RMSE per Fold",
+            color="RMSE", color_continuous_scale="Blues_r",
+            text=fold_df["RMSE"].round(3),
+        )
+        fig_cv.add_hline(y=rmse_cv.mean(), line_dash="dash", line_color="#00AEEF",
+                         annotation_text=f"Mean {rmse_cv.mean():.3f}")
+        fig_cv.update_traces(textposition="outside")
+        fig_cv.update_layout(showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig_cv, use_container_width=True)
+
+    # ── Hyperparameters ───────────────────────────────────────────────────────
+    if "🔧 Hyperparameters" in show and res["best_params"] is not None:
+        with st.expander("🔧 Auto-Tuned Hyperparameters", expanded=False):
+            st.caption(
+                f"Best parameters found by RandomizedSearchCV "
+                f"({res['n_iter']} iterations, {res['cv_folds']}-fold CV, scored on MAE)."
+            )
+            st.dataframe(
+                pd.DataFrame(list(res["best_params"].items()),
+                             columns=["Parameter", "Value"]),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ── Probability Scatter ───────────────────────────────────────────────────
+    if "🔵 Probability Scatter" in show and prob is not None:
+        st.markdown("#### 🔵 Model vs Market Probability (each dot = one game)")
+        outcome_labels = {"1": prob["side1_label"], "0": "Under / No Cover"}
+        prob_df = pd.DataFrame({
+            "Market P(Over/Cover)": prob["market_prob"],
+            "Model P(Over/Cover)":  prob["model_prob"],
+            "Outcome": pd.Series(prob["y_binary"]).astype(str).map(outcome_labels),
+        })
+        fig_prob = px.scatter(
+            prob_df,
+            x="Market P(Over/Cover)", y="Model P(Over/Cover)",
+            color="Outcome", opacity=0.55,
+            color_discrete_map={
+                prob["side1_label"]: "#2ca02c",
+                "Under / No Cover":  "#d62728",
+            },
+            title="Where model and market agree — and where they diverge",
+        )
+        fig_prob.add_shape(type="line", x0=0, y0=0, x1=1, y1=1,
+                           line=dict(color="gray", dash="dash"))
+        fig_prob.add_hline(y=0.5, line_dash="dot", line_color="lightgray")
+        fig_prob.add_vline(x=0.5, line_dash="dot", line_color="lightgray")
+        fig_prob.update_layout(xaxis_range=[0, 1], yaxis_range=[0, 1])
+        st.plotly_chart(fig_prob, use_container_width=True)
+        st.caption(
+            "Dots above the diagonal = model is more confident than the market. "
+            "Top-left / bottom-right quadrants = model and market disagree — "
+            "that's where potential betting edge lives."
+        )
+
+    # ── Actual vs Predicted & Residuals ──────────────────────────────────────
+    if "📉 Actual vs Predicted" in show:
+        col_left, col_right = st.columns(2)
+        y_t = res["y_test"]; y_p = res["y_pred"]
+        with col_left:
+            fig_scatter = px.scatter(
+                x=y_t, y=y_p,
+                labels={"x": f"Actual {res['target']}", "y": f"Predicted {res['target']}"},
+                title="Actual vs. Predicted", opacity=0.6,
+                color_discrete_sequence=["#1f77b4"],
+            )
+            mn, mx = min(y_t.min(), y_p.min()), max(y_t.max(), y_p.max())
+            fig_scatter.add_trace(go.Scatter(
+                x=[mn, mx], y=[mn, mx], mode="lines",
+                line=dict(color="red", dash="dash"), name="Perfect fit",
+            ))
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        with col_right:
+            residuals = y_t - y_p
+            fig_resid = px.histogram(
+                residuals, nbins=40,
+                labels={"value": "Residual", "count": "Frequency"},
+                title="Residuals Distribution",
+                color_discrete_sequence=["#ff7f0e"],
+            )
+            fig_resid.add_vline(x=0, line_dash="dash", line_color="red")
+            st.plotly_chart(fig_resid, use_container_width=True)
+
+    # ── Feature Importance ────────────────────────────────────────────────────
+    if "⭐ Feature Importance" in show:
+        st.subheader("Feature Importance / Coefficients")
+        if res["coef_df"] is not None:
+            fig_coef = px.bar(
+                res["coef_df"], x="Coefficient", y="Feature",
+                orientation="h", title="Model Coefficients (scaled)",
+                color="Coefficient",
+                color_continuous_scale="RdBu", color_continuous_midpoint=0,
+            )
+            fig_coef.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig_coef, use_container_width=True)
+        elif res["imp_df"] is not None:
+            fig_imp = px.bar(
+                res["imp_df"], x="Importance", y="Feature",
+                orientation="h", title="Feature Importance",
+                color="Importance", color_continuous_scale="Blues",
+            )
+            fig_imp.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig_imp, use_container_width=True)
+        else:
+            st.caption("This model type does not expose feature coefficients or importances.")
+
+    # ── Sample Predictions ────────────────────────────────────────────────────
+    if "📋 Sample Predictions" in show:
+        st.subheader("Sample Predictions")
+        st.dataframe(res["sample_df"], use_container_width=True)
+        st.download_button(
+            "⬇️ Download Predictions CSV",
+            data=res["csv_out"],
+            file_name=res["csv_filename"],
+            mime="text/csv",
+        )
 
 # ── Predict on New Data ────────────────────────────────────────────────────────
 if "trained_pipeline" in st.session_state:
@@ -993,7 +1193,9 @@ if "trained_pipeline" in st.session_state:
     else:  # API Feed URL
         api_sources = {
             "Custom URL": "",
-            "nflfastR play-by-play (sample)": "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_2023.csv",
+            "nflfastR play-by-play (sample)": (
+                "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_2023.csv"
+            ),
         }
         api_choice = st.selectbox("Select a source or choose Custom URL", list(api_sources.keys()))
         api_url = st.text_input(
@@ -1007,9 +1209,7 @@ if "trained_pipeline" in st.session_state:
                 try:
                     resp = requests.get(api_url.strip(), timeout=30)
                     resp.raise_for_status()
-                    content_type = resp.headers.get("Content-Type", "")
-                    raw = resp.content
-                    # Try CSV first, then JSON
+                    raw  = resp.content
                     try:
                         new_df = pd.read_csv(io.BytesIO(raw))
                     except Exception:
@@ -1023,25 +1223,20 @@ if "trained_pipeline" in st.session_state:
                 except requests.exceptions.RequestException as e:
                     st.error(f"Failed to fetch URL: {e}")
 
-    # ── Run predictions on the loaded DataFrame ────────────────────────────────
     if new_df is not None:
         st.markdown(f"**Loaded {len(new_df):,} rows × {new_df.shape[1]} columns.**")
-
-        # Validate that required feature columns are present
         missing_cols = [c for c in _features if c not in new_df.columns]
         if missing_cols:
             st.error(
                 f"The following feature columns are missing from the uploaded data: "
                 f"`{'`, `'.join(missing_cols)}`\n\n"
-                "Please make sure your file contains all features that were selected "
-                "during training."
+                "Please make sure your file contains all features that were selected during training."
             )
         else:
-            # Drop rows with nulls in feature columns and warn about it
             pred_input = new_df[_features].copy()
-            n_before = len(pred_input)
+            n_before   = len(pred_input)
             pred_input = pred_input.dropna()
-            n_dropped = n_before - len(pred_input)
+            n_dropped  = n_before - len(pred_input)
             if n_dropped > 0:
                 st.warning(
                     f"{n_dropped:,} row(s) were dropped because they had missing values "
@@ -1056,20 +1251,17 @@ if "trained_pipeline" in st.session_state:
 
                 result_df = pred_input.copy().reset_index(drop=True)
 
-                # Carry over non-feature columns from original upload for context
                 meta_cols = [c for c in new_df.columns if c not in _features]
                 for mc in meta_cols:
                     result_df.insert(0, mc, new_df.loc[pred_input.index, mc].values)
 
                 result_df["Predicted"] = np.round(new_preds, 2)
 
-                # P(Over/Cover) if the model supports it
                 if _resid_std is not None and _base_col in new_df.columns:
                     line_vals = new_df.loc[pred_input.index, _base_col].values.astype(float)
                     eff_line  = line_vals if _target == "total" else -line_vals
                     prob_vals = np.clip(
-                        norm.cdf((new_preds - eff_line) / _resid_std),
-                        1e-6, 1 - 1e-6,
+                        norm.cdf((new_preds - eff_line) / _resid_std), 1e-6, 1 - 1e-6
                     )
                     prob_vals = np.where(np.isnan(line_vals), np.nan, prob_vals)
                     result_df[f"P({_prob_label})"] = np.round(prob_vals, 3)
@@ -1079,7 +1271,6 @@ if "trained_pipeline" in st.session_state:
                         f"P({_prob_label}) will not be calculated."
                     )
 
-                # Show the target column if present
                 if _target in new_df.columns:
                     result_df["Actual"] = new_df.loc[pred_input.index, _target].values
                     result_df["Error"]  = np.round(
@@ -1089,7 +1280,6 @@ if "trained_pipeline" in st.session_state:
                 st.success(f"Predictions generated for {len(result_df):,} games.")
                 st.dataframe(result_df, use_container_width=True)
 
-                # Download
                 dl_csv = result_df.to_csv(index=False).encode()
                 st.download_button(
                     "⬇️ Download New Predictions CSV",
@@ -1113,7 +1303,13 @@ with st.expander("🔍 Data Explorer"):
     with col_filter:
         search_col = st.selectbox("Column to inspect", options=df.columns.tolist(), key="explore_col")
 
-    st.dataframe(explore_df[[search_col, "team", "opponent", "season", "week", target if target in df.columns else "team_score"]].head(200), use_container_width=True)
+    st.dataframe(
+        explore_df[[
+            search_col, "team", "opponent", "season", "week",
+            target if target in df.columns else "team_score"
+        ]].head(200),
+        use_container_width=True,
+    )
 
     st.markdown("**Descriptive statistics (numeric columns)**")
     st.dataframe(explore_df[ALL_NUMERIC].describe().T.round(3), use_container_width=True)
